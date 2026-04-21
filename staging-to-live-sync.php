@@ -81,6 +81,8 @@ class Staging_To_Live_Sync
 		add_action('wp_ajax_stls_generate_api_key', array($this, 'ajax_generate_api_key'));
 		add_action('wp_ajax_stls_sync_files', array($this, 'ajax_sync_files'));
 		add_action('wp_ajax_stls_load_directory', array($this, 'ajax_load_directory'));
+		add_action('wp_ajax_stls_compare_acf_field_groups', array($this, 'ajax_compare_acf_field_groups'));
+		add_action('wp_ajax_stls_sync_acf_field_group', array($this, 'ajax_sync_acf_field_group'));
 
 		// Enqueue scripts
 		add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
@@ -190,8 +192,12 @@ class Staging_To_Live_Sync
 
 	/**
 	 * Log sync activity
+	 *
+	 * @param int         $post_id             Post ID for content sync, or unused for special log types.
+	 * @param array|null  $file_sync_data      File batch sync metadata.
+	 * @param array|null  $acf_field_sync_data ACF field group sync: group_key, group_title, live_id, staging_id.
 	 */
-	private function log_sync_activity($post_id, $file_sync_data = null)
+	private function log_sync_activity($post_id, $file_sync_data = null, $acf_field_sync_data = null)
 	{
 		global $wpdb;
 
@@ -200,6 +206,46 @@ class Staging_To_Live_Sync
 		$user_id = get_current_user_id();
 		$user = wp_get_current_user();
 		$user_name = $user->display_name ? $user->display_name : $user->user_login;
+
+		// ACF field group sync → live
+		if ($acf_field_sync_data !== null && is_array($acf_field_sync_data) && !empty($acf_field_sync_data['group_key'])) {
+			$group_key = sanitize_text_field($acf_field_sync_data['group_key']);
+			$group_title = isset($acf_field_sync_data['group_title']) ? sanitize_text_field($acf_field_sync_data['group_title']) : '';
+			$live_id = isset($acf_field_sync_data['live_id']) ? (int) $acf_field_sync_data['live_id'] : 0;
+			$staging_id = isset($acf_field_sync_data['staging_id']) ? (int) $acf_field_sync_data['staging_id'] : 0;
+
+			$label = $group_title !== '' ? $group_title : $group_key;
+			$post_title = sprintf(
+				/* translators: %s: field group title or key */
+				__('ACF → Live: %s', 'staging-to-live-sync'),
+				$label
+			);
+			if ($group_title !== '' && $group_key !== '' && $group_title !== $group_key) {
+				$post_title .= ' (' . $group_key . ')';
+			}
+			if ($live_id > 0) {
+				$post_title .= ' — ' . sprintf(
+					/* translators: %d: field group post ID on live */
+					__('Live ID %d', 'staging-to-live-sync'),
+					$live_id
+				);
+			}
+
+			$wpdb->insert(
+				$table_name,
+				array(
+					'user_id' => $user_id,
+					'user_name' => $user_name,
+					'post_id' => $staging_id,
+					'post_title' => $post_title,
+					'post_type' => 'acf_field_sync',
+					'sync_time' => current_time('mysql'),
+				),
+				array('%d', '%s', '%d', '%s', '%s', '%s')
+			);
+
+			return $wpdb->insert_id;
+		}
 
 		// Handle file sync logging
 		if ($file_sync_data !== null && is_array($file_sync_data)) {
@@ -305,6 +351,16 @@ class Staging_To_Live_Sync
 			'manage_options',
 			'staging-to-live-sync-files',
 			array($this, 'render_file_sync_page')
+		);
+
+		// ACF Field Sync submenu
+		add_submenu_page(
+			'staging-to-live-sync',
+			__('ACF Field Sync', 'staging-to-live-sync'),
+			__('ACF Field Sync', 'staging-to-live-sync'),
+			'manage_options',
+			'staging-to-live-sync-acf',
+			array($this, 'render_acf_field_sync_page')
 		);
 
 		// Elementor Logs submenu (only if Elementor is selected)
@@ -786,7 +842,7 @@ class Staging_To_Live_Sync
 
 			<?php if (empty($logs)): ?>
 				<div class="notice notice-info">
-					<p><?php esc_html_e('No sync activity logs found. Logs will appear here when you sync posts.', 'staging-to-live-sync'); ?>
+					<p><?php esc_html_e('No sync activity logs found. Logs appear when you sync posts, files, or ACF field groups.', 'staging-to-live-sync'); ?>
 					</p>
 				</div>
 			<?php else: ?>
@@ -833,11 +889,17 @@ class Staging_To_Live_Sync
 										</td>
 										<td>
 											<?php
-											$post_type_obj = get_post_type_object($log->post_type);
-											if ($post_type_obj) {
-												echo esc_html($post_type_obj->labels->singular_name);
+											if ($log->post_type === 'acf_field_sync') {
+												esc_html_e('ACF Field Group', 'staging-to-live-sync');
+											} elseif ($log->post_type === 'file_sync') {
+												esc_html_e('File sync', 'staging-to-live-sync');
 											} else {
-												echo esc_html($log->post_type);
+												$post_type_obj = get_post_type_object($log->post_type);
+												if ($post_type_obj) {
+													echo esc_html($post_type_obj->labels->singular_name);
+												} else {
+													echo esc_html($log->post_type);
+												}
 											}
 											?>
 										</td>
@@ -1047,6 +1109,244 @@ class Staging_To_Live_Sync
 				stlsUpdateSelectedCount();
 			});
 		</script>
+		<?php
+	}
+
+	/**
+	 * Render ACF field group comparison page (staging vs live).
+	 */
+	public function render_acf_field_sync_page()
+	{
+		if (!current_user_can('manage_options')) {
+			return;
+		}
+
+		$acf_active = function_exists('acf_get_field_groups');
+		$field_groups = array();
+		if ($acf_active) {
+			$field_groups = acf_get_field_groups();
+			usort($field_groups, function ($a, $b) {
+				return strcasecmp(isset($a['title']) ? $a['title'] : '', isset($b['title']) ? $b['title'] : '');
+			});
+		}
+
+		$live_url = get_option('stls_live_url', '');
+		$live_key_set = get_option('stls_live_api_key', '');
+		$can_compare = $acf_active && !empty($live_url) && !empty($live_key_set);
+
+		?>
+		<div class="wrap stls-acf-field-sync-wrap">
+			<h1><?php echo esc_html(get_admin_page_title()); ?></h1>
+
+			<?php if (!$acf_active): ?>
+				<div class="notice notice-error">
+					<p><?php esc_html_e('Advanced Custom Fields (ACF) is not active on this site. Install and activate ACF to list field groups.', 'staging-to-live-sync'); ?></p>
+				</div>
+			<?php elseif (empty($live_url) || empty($live_key_set)): ?>
+				<div class="notice notice-warning">
+					<p>
+						<?php esc_html_e('Set Live URL and Live API key under Settings to compare this site’s field groups with production.', 'staging-to-live-sync'); ?>
+						<a href="<?php echo esc_url(admin_url('admin.php?page=staging-to-live-sync')); ?>"><?php esc_html_e('Settings', 'staging-to-live-sync'); ?></a>
+					</p>
+				</div>
+			<?php else: ?>
+				<p class="description">
+					<?php esc_html_e('Field groups listed below are loaded from this site (typically staging). Use Refresh comparison to fetch field groups from the live site and highlight groups that do not exist there yet. Use Sync to push a single group’s definition to live (creates or updates by field group key).', 'staging-to-live-sync'); ?>
+				</p>
+			<?php endif; ?>
+
+			<?php if ($acf_active && !empty($field_groups)): ?>
+				<p style="margin: 16px 0;">
+					<button type="button" class="button button-primary" id="stls-acf-refresh-comparison"
+						<?php echo $can_compare ? '' : 'disabled'; ?>>
+						<?php esc_html_e('Refresh comparison', 'staging-to-live-sync'); ?>
+					</button>
+					<span class="spinner" id="stls-acf-refresh-spinner" style="float: none; margin: 0 8px;"></span>
+					<span id="stls-acf-comparison-summary" style="color: #50575e;"></span>
+				</p>
+
+				<div class="stls-acf-table-container"
+					style="background: #fff; border: 1px solid #c3c4c7; box-shadow: 0 1px 1px rgba(0,0,0,.04); margin-top: 12px; overflow: auto;">
+					<table class="widefat striped" id="stls-acf-field-groups-table" style="margin: 0;">
+						<thead>
+							<tr>
+								<th scope="col" style="width: 30%;"><?php esc_html_e('Field group title', 'staging-to-live-sync'); ?></th>
+								<th scope="col" style="width: 20%;"><?php esc_html_e('Key', 'staging-to-live-sync'); ?></th>
+								<th scope="col" style="width: 8%;"><?php esc_html_e('Post ID', 'staging-to-live-sync'); ?></th>
+								<th scope="col" style="width: 18%;"><?php esc_html_e('Status (after refresh)', 'staging-to-live-sync'); ?></th>
+								<th scope="col" style="width: 24%;"><?php esc_html_e('Sync to live', 'staging-to-live-sync'); ?></th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ($field_groups as $group): ?>
+								<?php
+								$gkey = isset($group['key']) ? $group['key'] : '';
+								$gid = isset($group['ID']) ? (int) $group['ID'] : 0;
+								$title = isset($group['title']) ? $group['title'] : '';
+								$acf_edit_url = '';
+								if ($gid > 0) {
+									if (function_exists('acf_get_field_group_edit_link')) {
+										$acf_edit_url = acf_get_field_group_edit_link($gid);
+									}
+									if ($acf_edit_url === '' || $acf_edit_url === false) {
+										$acf_edit_url = get_edit_post_link($gid, 'raw');
+									}
+								}
+								$title_display = $title !== '' ? $title : ($gkey !== '' ? $gkey : '—');
+								?>
+								<tr class="stls-acf-group-row" data-group-key="<?php echo esc_attr($gkey); ?>">
+									<td>
+										<?php if ($acf_edit_url !== '' && $acf_edit_url !== false): ?>
+											<a href="<?php echo esc_url($acf_edit_url); ?>"><?php echo esc_html($title_display); ?></a>
+										<?php else: ?>
+											<?php echo esc_html($title_display); ?>
+										<?php endif; ?>
+									</td>
+									<td><code><?php echo esc_html($gkey); ?></code></td>
+									<td><?php echo $gid ? esc_html((string) $gid) : '—'; ?></td>
+									<td class="stls-acf-status"><?php esc_html_e('—', 'staging-to-live-sync'); ?></td>
+									<td class="stls-acf-sync-cell">
+										<?php if ($gkey !== '' && $can_compare): ?>
+											<button type="button" class="button stls-acf-sync-btn"
+												data-group-key="<?php echo esc_attr($gkey); ?>">
+												<?php esc_html_e('Sync', 'staging-to-live-sync'); ?>
+											</button>
+											<span class="stls-acf-sync-inline" style="margin-left: 8px; color: #646970; font-size: 12px;"></span>
+										<?php elseif ($gkey === ''): ?>
+											<span class="description"><?php esc_html_e('—', 'staging-to-live-sync'); ?></span>
+										<?php else: ?>
+											<button type="button" class="button" disabled><?php esc_html_e('Sync', 'staging-to-live-sync'); ?></button>
+										<?php endif; ?>
+									</td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+
+				<style>
+					.stls-acf-missing-on-live td {
+						background-color: #fcf0f1 !important;
+						border-left: 4px solid #d63638;
+					}
+					.stls-acf-missing-on-live .stls-acf-status {
+						font-weight: 600;
+						color: #b32d2e;
+					}
+					.stls-acf-differs-from-live td {
+						background-color: #fff8e5 !important;
+						border-left: 4px solid #dba617;
+					}
+					.stls-acf-differs-from-live .stls-acf-status {
+						font-weight: 600;
+						color: #996800;
+					}
+					.stls-acf-on-live .stls-acf-status {
+						color: #1d8f3a;
+					}
+				</style>
+				<script>
+					(function ($) {
+						var nonce = '<?php echo esc_js(wp_create_nonce('stls_acf_field_sync')); ?>';
+						function setRowComparisonState($row, state) {
+							$row.removeClass('stls-acf-missing-on-live stls-acf-on-live stls-acf-differs-from-live');
+							var key = $row.data('group-key');
+							if (!key) {
+								$row.find('.stls-acf-status').text('<?php echo esc_js(__('No key — compare skipped', 'staging-to-live-sync')); ?>');
+								return;
+							}
+							if (state === 'missing') {
+								$row.addClass('stls-acf-missing-on-live');
+								$row.find('.stls-acf-status').text('<?php echo esc_js(__('Missing on live', 'staging-to-live-sync')); ?>');
+							} else if (state === 'different') {
+								$row.addClass('stls-acf-differs-from-live');
+								$row.find('.stls-acf-status').text('<?php echo esc_js(__('Updated on Staging', 'staging-to-live-sync')); ?>');
+							} else {
+								$row.addClass('stls-acf-on-live');
+								$row.find('.stls-acf-status').text('<?php echo esc_js(__('In sync with live', 'staging-to-live-sync')); ?>');
+							}
+						}
+						$('#stls-acf-refresh-comparison').on('click', function () {
+							var $btn = $(this);
+							var $spin = $('#stls-acf-refresh-spinner');
+							var $sum = $('#stls-acf-comparison-summary');
+							$btn.prop('disabled', true);
+							$spin.addClass('is-active');
+							$sum.text('');
+							$.post(ajaxurl, {
+								action: 'stls_compare_acf_field_groups',
+								nonce: nonce
+							}).done(function (res) {
+								if (!res || !res.success) {
+									var msg = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Request failed.', 'staging-to-live-sync')); ?>';
+									$sum.css('color', '#b32d2e').text(msg);
+									return;
+								}
+								var missing = res.data.missing_keys || [];
+								var different = res.data.different_keys || [];
+								var missSet = {};
+								var diffSet = {};
+								missing.forEach(function (k) { missSet[k] = true; });
+								different.forEach(function (k) { diffSet[k] = true; });
+								$('#stls-acf-field-groups-table tbody tr.stls-acf-group-row').each(function () {
+									var $r = $(this);
+									var k = $r.data('group-key');
+									if (!k) {
+										setRowComparisonState($r, 'synced');
+										return;
+									}
+									if (missSet[k]) {
+										setRowComparisonState($r, 'missing');
+									} else if (diffSet[k]) {
+										setRowComparisonState($r, 'different');
+									} else {
+										setRowComparisonState($r, 'synced');
+									}
+								});
+								$sum.css('color', '#50575e').text(res.data.summary || '');
+							}).fail(function () {
+								$sum.css('color', '#b32d2e').text('<?php echo esc_js(__('Network error.', 'staging-to-live-sync')); ?>');
+							}).always(function () {
+								$btn.prop('disabled', false);
+								$spin.removeClass('is-active');
+							});
+						});
+
+						$('#stls-acf-field-groups-table').on('click', '.stls-acf-sync-btn', function () {
+							var $syncBtn = $(this);
+							var gkey = $syncBtn.data('group-key');
+							if (!gkey) {
+								return;
+							}
+							var $row = $syncBtn.closest('tr');
+							var $inline = $row.find('.stls-acf-sync-inline');
+							$syncBtn.prop('disabled', true);
+							$inline.text('<?php echo esc_js(__('Syncing…', 'staging-to-live-sync')); ?>').css('color', '#646970');
+							$.post(ajaxurl, {
+								action: 'stls_sync_acf_field_group',
+								nonce: nonce,
+								group_key: gkey
+							}).done(function (res) {
+								if (!res || !res.success) {
+									var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Sync failed.', 'staging-to-live-sync')); ?>';
+									$inline.text(err).css('color', '#b32d2e');
+									return;
+								}
+								$inline.text(res.data.message || '<?php echo esc_js(__('Synced.', 'staging-to-live-sync')); ?>').css('color', '#1d8f3a');
+								$row.removeClass('stls-acf-missing-on-live stls-acf-differs-from-live').addClass('stls-acf-on-live');
+								$row.find('.stls-acf-status').text('<?php echo esc_js(__('In sync with live', 'staging-to-live-sync')); ?>');
+							}).fail(function () {
+								$inline.text('<?php echo esc_js(__('Network error.', 'staging-to-live-sync')); ?>').css('color', '#b32d2e');
+							}).always(function () {
+								$syncBtn.prop('disabled', false);
+							});
+						});
+					})(jQuery);
+				</script>
+			<?php elseif ($acf_active && empty($field_groups)): ?>
+				<p class="description"><?php esc_html_e('No ACF field groups found on this site.', 'staging-to-live-sync'); ?></p>
+			<?php endif; ?>
+		</div>
 		<?php
 	}
 
@@ -3780,6 +4080,248 @@ class Staging_To_Live_Sync
 	}
 
 	/**
+	 * AJAX: compare ACF field groups on this site vs live (via REST).
+	 */
+	public function ajax_compare_acf_field_groups()
+	{
+		if (!isset($_POST['nonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['nonce'])), 'stls_acf_field_sync')) {
+			wp_send_json_error(array('message' => __('Security check failed.', 'staging-to-live-sync')));
+		}
+
+		if (!current_user_can('manage_options')) {
+			wp_send_json_error(array('message' => __('You do not have permission to run this comparison.', 'staging-to-live-sync')));
+		}
+
+		if (!function_exists('acf_get_field_groups')) {
+			wp_send_json_error(array('message' => __('ACF is not active on this site.', 'staging-to-live-sync')));
+		}
+
+		$live_url = untrailingslashit((string) get_option('stls_live_url', ''));
+		$api_key = (string) get_option('stls_live_api_key', '');
+
+		if ($live_url === '' || $api_key === '') {
+			wp_send_json_error(array('message' => __('Configure Live URL and Live API key in Settings.', 'staging-to-live-sync')));
+		}
+
+		if (!filter_var($live_url, FILTER_VALIDATE_URL)) {
+			wp_send_json_error(array('message' => __('Invalid Live URL in settings.', 'staging-to-live-sync')));
+		}
+
+		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/acf-field-groups';
+		$response = wp_remote_get(
+			$endpoint,
+			array(
+				'timeout' => 90,
+				'headers' => array(
+					'X-STLS-API-Key' => $api_key,
+					'Accept' => 'application/json',
+				),
+			)
+		);
+
+		if (is_wp_error($response)) {
+			wp_send_json_error(array('message' => $response->get_error_message()));
+		}
+
+		$code = wp_remote_retrieve_response_code($response);
+		$body = wp_remote_retrieve_body($response);
+		$data = json_decode($body, true);
+
+		if ($code !== 200) {
+			$msg = __('Live site returned an error. Check the Live API key and that this plugin is active on live.', 'staging-to-live-sync');
+			if (is_array($data)) {
+				if (!empty($data['message'])) {
+					$msg = $data['message'];
+				} elseif (!empty($data['data']['message'])) {
+					$msg = $data['data']['message'];
+				}
+			}
+			wp_send_json_error(array('message' => $msg, 'http_status' => $code));
+		}
+
+		if (!is_array($data) || !isset($data['groups']) || !is_array($data['groups'])) {
+			wp_send_json_error(array('message' => __('Unexpected response from live site.', 'staging-to-live-sync')));
+		}
+
+		$live_keys = array();
+		$live_hashes = array();
+		foreach ($data['groups'] as $row) {
+			if (!is_array($row) || empty($row['key'])) {
+				continue;
+			}
+			$k = (string) $row['key'];
+			$live_keys[$k] = true;
+			if (!empty($row['content_hash']) && is_string($row['content_hash'])) {
+				$live_hashes[$k] = $row['content_hash'];
+			}
+		}
+
+		$staging_groups = acf_get_field_groups();
+		$missing = array();
+		$different = array();
+		foreach ($staging_groups as $g) {
+			$k = isset($g['key']) ? $g['key'] : '';
+			if ($k === '') {
+				continue;
+			}
+			if (empty($live_keys[$k])) {
+				$missing[] = $k;
+				continue;
+			}
+			if (empty($live_hashes[$k]) || !function_exists('stls_acf_field_group_content_hash')) {
+				continue;
+			}
+			$local_hash = stls_acf_field_group_content_hash($k);
+			if ($local_hash !== '' && $local_hash !== $live_hashes[$k]) {
+				$different[] = $k;
+			}
+		}
+
+		$live_n = count($data['groups']);
+		$staging_n = count($staging_groups);
+		$missing_n = count($missing);
+		$different_n = count($different);
+
+		wp_send_json_success(
+			array(
+				'missing_keys' => $missing,
+				'different_keys' => $different,
+				'live_count' => $live_n,
+				'staging_count' => $staging_n,
+				'missing_count' => $missing_n,
+				'different_count' => $different_n,
+				'summary' => sprintf(
+					/* translators: 1: field groups on live, 2: on this site, 3: missing on live, 4: present on live but content differs */
+					__('Live: %1$d groups — This site: %2$d — Missing on live: %3$d — Updated on staging: %4$d', 'staging-to-live-sync'),
+					$live_n,
+					$staging_n,
+					$missing_n,
+					$different_n
+				),
+			)
+		);
+	}
+
+	/**
+	 * AJAX: push one ACF field group from this site to live via REST.
+	 */
+	public function ajax_sync_acf_field_group()
+	{
+		if (!isset($_POST['nonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['nonce'])), 'stls_acf_field_sync')) {
+			wp_send_json_error(array('message' => __('Security check failed.', 'staging-to-live-sync')));
+		}
+
+		if (!current_user_can('manage_options')) {
+			wp_send_json_error(array('message' => __('You do not have permission to sync field groups.', 'staging-to-live-sync')));
+		}
+
+		$group_key = isset($_POST['group_key']) ? sanitize_text_field(wp_unslash($_POST['group_key'])) : '';
+		if ($group_key === '') {
+			wp_send_json_error(array('message' => __('Field group key is required.', 'staging-to-live-sync')));
+		}
+
+		if (!function_exists('acf_get_field_group')) {
+			wp_send_json_error(array('message' => __('ACF is not active on this site.', 'staging-to-live-sync')));
+		}
+
+		if (!acf_get_field_group($group_key)) {
+			wp_send_json_error(array('message' => __('Field group not found on this site.', 'staging-to-live-sync')));
+		}
+
+		$export = stls_build_acf_field_group_export($group_key);
+		if (is_wp_error($export)) {
+			wp_send_json_error(array('message' => $export->get_error_message()));
+		}
+
+		$live_url = untrailingslashit((string) get_option('stls_live_url', ''));
+		$api_key = (string) get_option('stls_live_api_key', '');
+
+		if ($live_url === '' || $api_key === '') {
+			wp_send_json_error(array('message' => __('Configure Live URL and Live API key in Settings.', 'staging-to-live-sync')));
+		}
+
+		if (!filter_var($live_url, FILTER_VALIDATE_URL)) {
+			wp_send_json_error(array('message' => __('Invalid Live URL in settings.', 'staging-to-live-sync')));
+		}
+
+		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/sync-acf-field-group';
+
+		$response = wp_remote_post(
+			$endpoint,
+			array(
+				'timeout' => 120,
+				'headers' => array(
+					'Content-Type' => 'application/json; charset=utf-8',
+					'X-STLS-API-Key' => $api_key,
+				),
+				'body' => wp_json_encode(array('field_group' => $export)),
+			)
+		);
+
+		if (is_wp_error($response)) {
+			wp_send_json_error(array('message' => $response->get_error_message()));
+		}
+
+		$code = wp_remote_retrieve_response_code($response);
+		$body = wp_remote_retrieve_body($response);
+		$data = json_decode($body, true);
+
+		if ($code !== 200) {
+			$msg = __('Live site could not import the field group.', 'staging-to-live-sync');
+			if (is_array($data)) {
+				if (!empty($data['message']) && is_string($data['message'])) {
+					$msg = $data['message'];
+				} elseif (!empty($data['data']['message']) && is_string($data['data']['message'])) {
+					$msg = $data['data']['message'];
+				}
+			}
+			wp_send_json_error(array('message' => $msg, 'http_status' => $code));
+		}
+
+		if (empty($data['success'])) {
+			wp_send_json_error(array('message' => __('Import failed on live.', 'staging-to-live-sync')));
+		}
+
+		$synced_title = isset($data['title']) && $data['title'] !== '' ? $data['title'] : $group_key;
+		$live_fg_id = isset($data['id']) ? (int) $data['id'] : 0;
+
+		$fg_local = acf_get_field_group($group_key);
+		$staging_fg_id = ($fg_local && !empty($fg_local['ID'])) ? (int) $fg_local['ID'] : 0;
+
+		$sync_ts = current_time('timestamp');
+		$sync_time_display = date_i18n(
+			get_option('date_format') . ' ' . get_option('time_format'),
+			$sync_ts
+		);
+
+		$this->log_sync_activity(
+			0,
+			null,
+			array(
+				'group_key' => $group_key,
+				'group_title' => $synced_title,
+				'live_id' => $live_fg_id,
+				'staging_id' => $staging_fg_id,
+			)
+		);
+
+		wp_send_json_success(
+			array(
+				'message' => sprintf(
+					/* translators: 1: field group title, 2: localized date/time of sync */
+					__('Synced "%1$s" to live at %2$s.', 'staging-to-live-sync'),
+					$synced_title,
+					$sync_time_display
+				),
+				'key' => isset($data['key']) ? $data['key'] : $group_key,
+				'live_id' => $live_fg_id,
+				'sync_time' => current_time('mysql'),
+				'sync_time_display' => $sync_time_display,
+			)
+		);
+	}
+
+	/**
 	 * Sync a single file to live site
 	 */
 	private function sync_file_to_live($staging_file_url, $file_path, $live_url, $api_key)
@@ -4217,6 +4759,30 @@ add_action('rest_api_init', function () {
 			return stls_check_sync_permission($request);
 		},
 	));
+
+	register_rest_route(
+		'stls/v1',
+		'/acf-field-groups',
+		array(
+			'methods' => 'GET',
+			'callback' => 'stls_handle_acf_field_groups_request',
+			'permission_callback' => function ($request) {
+				return stls_check_sync_permission($request);
+			},
+		)
+	);
+
+	register_rest_route(
+		'stls/v1',
+		'/sync-acf-field-group',
+		array(
+			'methods' => 'POST',
+			'callback' => 'stls_handle_acf_sync_field_group_request',
+			'permission_callback' => function ($request) {
+				return stls_check_sync_permission($request);
+			},
+		)
+	);
 });
 
 /**
@@ -4343,6 +4909,174 @@ function stls_get_term_by_staging_id($staging_term_id, $taxonomy)
 	}
 
 	return false;
+}
+
+/**
+ * Build export-ready ACF field group payload (with nested fields) for syncing to another site.
+ *
+ * @param string $group_key ACF field group key (e.g. group_xxx).
+ * @return array|WP_Error
+ */
+function stls_build_acf_field_group_export($group_key)
+{
+	if (!function_exists('acf_get_field_group') || !function_exists('acf_get_fields') || !function_exists('acf_prepare_field_group_for_export')) {
+		return new WP_Error('acf_required', __('Advanced Custom Fields is not available.', 'staging-to-live-sync'));
+	}
+
+	$group_key = sanitize_text_field($group_key);
+	if ($group_key === '') {
+		return new WP_Error('invalid_key', __('Invalid field group key.', 'staging-to-live-sync'));
+	}
+
+	$field_group = acf_get_field_group($group_key);
+	if (!$field_group || empty($field_group['key'])) {
+		return new WP_Error('not_found', __('Field group not found.', 'staging-to-live-sync'));
+	}
+
+	$field_group['fields'] = acf_get_fields($field_group);
+
+	return acf_prepare_field_group_for_export($field_group);
+}
+
+/**
+ * Stable hash of export payload for comparing staging vs live without transferring full JSON.
+ *
+ * @param string $group_key ACF field group key.
+ * @return string 64-char sha256 hex, or empty string if unavailable.
+ */
+function stls_acf_field_group_content_hash($group_key)
+{
+	$export = stls_build_acf_field_group_export($group_key);
+	if (is_wp_error($export)) {
+		return '';
+	}
+
+	$json = wp_json_encode($export, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+	if (!is_string($json) || $json === '') {
+		return '';
+	}
+
+	return hash('sha256', $json);
+}
+
+/**
+ * REST: list ACF field groups on this site (used by staging admin to diff against live).
+ *
+ * @param WP_REST_Request $request Request.
+ * @return WP_REST_Response|WP_Error
+ */
+function stls_handle_acf_field_groups_request(WP_REST_Request $request)
+{
+	if (!function_exists('acf_get_field_groups')) {
+		return new WP_Error(
+			'acf_inactive',
+			__('Advanced Custom Fields is not active on this site.', 'staging-to-live-sync'),
+			array('status' => 503)
+		);
+	}
+
+	$groups = acf_get_field_groups();
+	$out = array();
+
+	foreach ($groups as $g) {
+		if (!is_array($g)) {
+			continue;
+		}
+		$key = isset($g['key']) ? (string) $g['key'] : '';
+		$out[] = array(
+			'id' => isset($g['ID']) ? (int) $g['ID'] : 0,
+			'key' => $key,
+			'title' => isset($g['title']) ? (string) $g['title'] : '',
+			'content_hash' => ($key !== '' && function_exists('stls_acf_field_group_content_hash')) ? stls_acf_field_group_content_hash($key) : '',
+		);
+	}
+
+	return rest_ensure_response(array('groups' => $out));
+}
+
+/**
+ * REST (live site): import one ACF field group from staging export payload.
+ *
+ * @param WP_REST_Request $request Request.
+ * @return WP_REST_Response|WP_Error
+ */
+function stls_handle_acf_sync_field_group_request(WP_REST_Request $request)
+{
+	if (!function_exists('acf_get_field_group') || !function_exists('acf_import_field_group')) {
+		return new WP_Error(
+			'acf_inactive',
+			__('Advanced Custom Fields is not active or is too old for import on this site.', 'staging-to-live-sync'),
+			array('status' => 503)
+		);
+	}
+
+	$params = $request->get_json_params();
+	if (empty($params) && $request->get_body()) {
+		$params = json_decode($request->get_body(), true);
+	}
+
+	if (empty($params['field_group']) || !is_array($params['field_group'])) {
+		return new WP_Error(
+			'invalid_request',
+			__('Missing field_group in request body.', 'staging-to-live-sync'),
+			array('status' => 400)
+		);
+	}
+
+	$field_group = $params['field_group'];
+	if (empty($field_group['key']) || !is_string($field_group['key'])) {
+		return new WP_Error(
+			'invalid_field_group',
+			__('Field group key is required.', 'staging-to-live-sync'),
+			array('status' => 400)
+		);
+	}
+
+	if (function_exists('acf_is_field_group_key') && !acf_is_field_group_key($field_group['key'])) {
+		return new WP_Error(
+			'invalid_field_group',
+			__('Invalid ACF field group key.', 'staging-to-live-sync'),
+			array('status' => 400)
+		);
+	}
+
+	$existing = acf_get_field_group($field_group['key']);
+	if ($existing && !empty($existing['ID'])) {
+		$field_group['ID'] = (int) $existing['ID'];
+	} else {
+		$field_group['ID'] = 0;
+	}
+
+	if (empty($field_group['fields']) || !is_array($field_group['fields'])) {
+		$field_group['fields'] = array();
+	}
+
+	try {
+		$result = acf_import_field_group($field_group);
+	} catch (Throwable $e) {
+		return new WP_Error(
+			'import_failed',
+			$e->getMessage(),
+			array('status' => 500)
+		);
+	}
+
+	if (empty($result['key'])) {
+		return new WP_Error(
+			'import_failed',
+			__('ACF import did not return a valid field group.', 'staging-to-live-sync'),
+			array('status' => 500)
+		);
+	}
+
+	return rest_ensure_response(
+		array(
+			'success' => true,
+			'key' => $result['key'],
+			'title' => isset($result['title']) ? $result['title'] : '',
+			'id' => isset($result['ID']) ? (int) $result['ID'] : 0,
+		)
+	);
 }
 
 /**
@@ -4868,6 +5602,43 @@ function stls_handle_sync_request(WP_REST_Request $request)
 }
 
 /**
+ * Write string to a file using fopen/fwrite/flock.
+ * Managed hosts (e.g. WP Engine) may disable file_put_contents(); this path usually remains available.
+ *
+ * @param string $path     Absolute filesystem path.
+ * @param string $contents Binary-safe content.
+ * @param bool   $append   If true, append; otherwise truncate then write.
+ * @return int|false Bytes written, or false on failure.
+ */
+function stls_fwrite_contents($path, $contents, $append = false)
+{
+	$mode = $append ? 'ab' : 'wb';
+	$fp = @fopen($path, $mode);
+	if (false === $fp) {
+		return false;
+	}
+	if (!@flock($fp, LOCK_EX)) {
+		fclose($fp);
+		return false;
+	}
+	$length = strlen($contents);
+	$written = 0;
+	while ($written < $length) {
+		$n = @fwrite($fp, substr($contents, $written));
+		if (false === $n || 0 === $n) {
+			flock($fp, LOCK_UN);
+			fclose($fp);
+			return false;
+		}
+		$written += $n;
+	}
+	@fflush($fp);
+	flock($fp, LOCK_UN);
+	fclose($fp);
+	return $written;
+}
+
+/**
  * Handle file sync request on live site
  */
 function stls_handle_file_sync_request(WP_REST_Request $request)
@@ -4877,7 +5648,7 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 	$write_log = function ($message) use ($log_file) {
 		$timestamp = date('Y-m-d H:i:s');
 		$log_entry = "[{$timestamp}] {$message}\n";
-		@file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
+		stls_fwrite_contents($log_file, $log_entry, true);
 		// Also try error_log
 		@error_log($message);
 	};
@@ -5208,8 +5979,8 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 		// Clear any previous PHP errors
 		$previous_error = error_get_last();
 
-		// Attempt to write to temporary file first
-		$file_written = @file_put_contents($temp_file, $file_body, LOCK_EX);
+		// Attempt to write to temporary file first (avoid file_put_contents — often disabled on managed hosting)
+		$file_written = stls_fwrite_contents($temp_file, $file_body, false);
 
 		// Set permissions on temp file if it was created
 		if ($file_written !== false && file_exists($temp_file)) {
@@ -5246,7 +6017,7 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 
 			// Try direct write as fallback
 			$force_log('STLS File Sync [LIVE]: Attempting direct write as fallback');
-			$direct_write = @file_put_contents($full_file_path, $file_body, LOCK_EX);
+			$direct_write = stls_fwrite_contents($full_file_path, $file_body, false);
 			if ($direct_write !== false) {
 				$force_log('STLS File Sync [LIVE]: Direct write succeeded!');
 				@chmod($full_file_path, $file_perms);
@@ -5421,7 +6192,7 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 						if (!$copied) {
 							// Last resort: try direct write
 							$force_log('STLS File Sync [LIVE]: Copy failed, attempting direct write as last resort');
-							$direct_write = @file_put_contents($full_file_path, $file_body, LOCK_EX);
+							$direct_write = stls_fwrite_contents($full_file_path, $file_body, false);
 
 							if ($direct_write !== false) {
 								$force_log('STLS File Sync [LIVE]: Direct write succeeded!');
@@ -5602,7 +6373,7 @@ function stls_download_and_attach_image($image_url, $post_id, $is_elementor_cont
 	$upload_dir = wp_upload_dir();
 	$tmp_file = $upload_dir['basedir'] . '/tmp_' . $filename;
 
-	if (!file_put_contents($tmp_file, $file_content)) {
+	if (false === stls_fwrite_contents($tmp_file, $file_content, false)) {
 		if ($debug_mode) {
 			error_log('STLS Download: Failed to write temp file: ' . $tmp_file);
 		}
