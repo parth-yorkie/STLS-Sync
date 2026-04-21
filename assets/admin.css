@@ -1,0 +1,72 @@
+/* Sync Button Styles */
+.stls-sync-post {
+	color: #2271b1;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.stls-sync-post:hover {
+	color: #135e96;
+	text-decoration: underline;
+}
+
+.stls-sync-post.stls-syncing {
+	color: #646970;
+	cursor: default;
+	text-decoration: none;
+	opacity: 0.6;
+}
+
+.stls-sync-post.stls-sync-success {
+	color: #00a32a;
+	cursor: default;
+	text-decoration: none;
+	font-weight: 500;
+}
+
+.stls-sync-post.stls-sync-error {
+	color: #d63638;
+	cursor: default;
+	text-decoration: none;
+}
+
+.stls-sync-post:disabled {
+	pointer-events: none;
+	opacity: 0.6;
+}
+
+/* API Key Generator Styles */
+.stls-api-key-wrapper {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 5px;
+}
+
+.stls-api-key-input {
+	flex: 1;
+	max-width: 500px;
+	font-family: 'Courier New', monospace;
+	font-size: 13px;
+	background-color: #f6f7f7;
+}
+
+.stls-generate-key-btn,
+.stls-copy-key-btn {
+	margin-left: 0;
+	white-space: nowrap;
+}
+
+.stls-generate-key-btn:disabled,
+.stls-copy-key-btn:disabled {
+	opacity: 0.6;
+	cursor: not-allowed;
+}
+
+.stls-generate-key-btn.button-primary,
+.stls-copy-key-btn.button-primary {
+	background-color: #00a32a;
+	border-color: #00a32a;
+	color: #fff;
+}
+
