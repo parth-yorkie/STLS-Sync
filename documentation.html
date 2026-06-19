@@ -256,6 +256,40 @@
       margin-bottom: 10px;
     }
 
+    .video-embed {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin: 20px 0 28px;
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+    }
+
+    .video-embed-inner {
+      position: relative;
+      width: 100%;
+      padding-bottom: 56.25%;
+      height: 0;
+      background: #000;
+    }
+
+    .video-embed-inner iframe {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+
+    .video-embed figcaption {
+      padding: 12px 16px;
+      font-size: 0.88rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+
     .card-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -659,6 +693,13 @@
         <figcaption><strong>Enter your website addresses</strong> and set up the Live API Key. Generate the key on live, copy it, then paste the same key on staging. Click Save Settings on both sites.</figcaption>
       </figure>
 
+      <figure class="video-embed">
+        <div class="video-embed-inner">
+          <iframe src="https://www.youtube.com/embed/v9qUYEsJoZo" title="STLS Plugin Setting" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+        </div>
+        <figcaption>Video walkthrough — STLS plugin settings</figcaption>
+      </figure>
+
       <span class="screenshot-label">Screenshot — Page builder &amp; SFTP</span>
       <figure class="screenshot">
         <img src="documentation/assets/screenshots/03-settings-sftp.png" alt="STLS Settings showing page builder selection and SFTP fallback options" loading="lazy" />
@@ -845,6 +886,13 @@
         <figcaption><strong>Browse theme folders</strong>, check the files you want, then click <strong>Sync Files</strong>. Expand folders by clicking them. Use search to find a specific file quickly.</figcaption>
       </figure>
 
+      <figure class="video-embed">
+        <div class="video-embed-inner">
+          <iframe src="https://www.youtube.com/embed/G1c5I9k3Sz4" title="STLS File Sync" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+        </div>
+        <figcaption>Video walkthrough — STLS file sync</figcaption>
+      </figure>
+
       <p>If files couldn't be uploaded automatically (common on WP Engine), you'll see a yellow notice in Settings with an <strong>Apply Queued Files via SFTP</strong> button. Click it to retry, or ask your developer for help.</p>
     </section>
 
@@ -875,6 +923,13 @@
       <figure class="screenshot">
         <img src="documentation/assets/screenshots/06-acf-sync.png" alt="ACF Field Sync page showing field groups with Missing on live, Updated on Staging, and In sync statuses" loading="lazy" />
         <figcaption><strong>Click Refresh comparison</strong> to check live. Red rows = missing on live. Yellow = updated on staging. Green = already in sync. Click <strong>Sync</strong> on any row that needs updating.</figcaption>
+      </figure>
+
+      <figure class="video-embed">
+        <div class="video-embed-inner">
+          <iframe src="https://www.youtube.com/embed/pX8dWlDh4hY" title="STLS ACF Fields Sync" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+        </div>
+        <figcaption>Video walkthrough — STLS ACF field sync</figcaption>
       </figure>
 
       <div class="tip">
@@ -1102,7 +1157,7 @@
 <footer>
   <div class="inner">
     <p>Staging to Live Sync · User Guide · York IE · <a href="https://york.ie">york.ie</a></p>
-    <p style="margin-top:8px">Open this file in any browser. For technical/API documentation, contact your development team.</p>
+    <p style="margin-top:8px">Open this file in any browser — no server required.</p>
   </div>
 </footer>
 
