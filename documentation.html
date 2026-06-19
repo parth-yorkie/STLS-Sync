@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Staging to Live Sync — User Guide</title>
+  <style>
+    :root {
+      --brand: #00B48A;
+      --brand-dark: #009a76;
+      --brand-soft: #e8faf5;
+      --brand-muted: rgba(0, 180, 138, 0.12);
+      --bg: #f6f8f7;
+      --surface: #fff;
+      --text: #14201c;
+      --muted: #5a6b65;
+      --border: #dde5e2;
+      --warning: #9a6700;
+      --warning-bg: #fff8e5;
+      --danger-bg: #fef2f2;
+      --danger: #b91c1c;
+      --radius: 10px;
+      --sidebar: 250px;
+      --content: 780px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+    }
+
+    html { scroll-behavior: smooth; scroll-padding-top: 32px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      font-size: 17px;
+      line-height: 1.75;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { color: var(--brand-dark); text-decoration: underline; }
+
+    header {
+      background: linear-gradient(180deg, #fff 0%, var(--brand-soft) 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 44px 32px 40px;
+    }
+
+    header .inner {
+      max-width: calc(var(--sidebar) + var(--content) + 72px);
+      margin: 0 auto;
+    }
+
+    .brand-bar {
+      width: 56px; height: 4px;
+      background: var(--brand);
+      border-radius: 2px;
+      margin-bottom: 22px;
+    }
+
+    header h1 {
+      font-size: 2.1rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      margin-bottom: 12px;
+    }
+
+    header .lead {
+      color: var(--muted);
+      font-size: 1.15rem;
+      max-width: 620px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .meta span {
+      background: var(--surface);
+      color: var(--brand-dark);
+      border: 1px solid var(--brand-muted);
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 500;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: var(--sidebar) 1fr;
+      gap: 48px;
+      max-width: calc(var(--sidebar) + var(--content) + 72px);
+      margin: 0 auto;
+      padding: 40px 32px 80px;
+      align-items: start;
+    }
+
+    .sidebar { position: sticky; top: 28px; }
+
+    .sidebar-inner {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+      max-height: calc(100vh - 56px);
+      overflow-y: auto;
+    }
+
+    .sidebar-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      padding: 0 18px 10px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 6px;
+    }
+
+    nav.toc { display: flex; flex-direction: column; }
+
+    nav.toc a {
+      display: block;
+      padding: 8px 18px;
+      font-size: 0.88rem;
+      color: var(--muted);
+      border-left: 3px solid transparent;
+      transition: color 0.2s, background 0.2s, border-color 0.2s;
+      text-decoration: none;
+    }
+
+    nav.toc a:hover {
+      color: var(--brand-dark);
+      background: var(--brand-soft);
+    }
+
+    nav.toc a.active {
+      color: var(--brand-dark);
+      font-weight: 600;
+      background: var(--brand-soft);
+      border-left-color: var(--brand);
+    }
+
+    .content { min-width: 0; max-width: var(--content); }
+
+    section {
+      scroll-margin-top: 32px;
+      margin-bottom: 60px;
+      padding-bottom: 60px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    section:last-child {
+      border-bottom: none;
+      margin-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    h2 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    h2::before {
+      content: "";
+      width: 6px; height: 26px;
+      background: var(--brand);
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+
+    h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin: 32px 0 14px;
+      color: var(--text);
+    }
+
+    h4 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 22px 0 10px;
+      color: var(--brand-dark);
+    }
+
+    p { margin-bottom: 16px; }
+    ul, ol { margin: 0 0 18px 1.35rem; }
+    li { margin-bottom: 8px; }
+
+    .figure {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      margin: 24px 0;
+      text-align: center;
+    }
+
+    .figure svg { max-width: 100%; height: auto; }
+
+    .figure figcaption {
+      margin-top: 16px;
+      font-size: 0.9rem;
+      color: var(--muted);
+      text-align: left;
+      line-height: 1.55;
+    }
+
+    .screenshot {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin: 24px 0;
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+    }
+
+    .screenshot img {
+      display: block;
+      width: 100%;
+      height: auto;
+      vertical-align: middle;
+    }
+
+    .screenshot figcaption {
+      padding: 14px 18px;
+      font-size: 0.9rem;
+      color: var(--muted);
+      line-height: 1.55;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .screenshot figcaption strong {
+      color: var(--brand-dark);
+    }
+
+    .screenshot-label {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--brand-dark);
+      background: var(--brand-soft);
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin-bottom: 10px;
+    }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 22px 0;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .card strong {
+      display: block;
+      font-size: 0.98rem;
+      margin-bottom: 6px;
+      color: var(--brand-dark);
+    }
+
+    .card span {
+      font-size: 0.9rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+      margin: 20px 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--brand-soft);
+      font-weight: 600;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--brand-dark);
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    .note, .tip, .warn-box, .dont-box {
+      padding: 16px 20px;
+      border-radius: var(--radius);
+      margin: 22px 0;
+      font-size: 0.96rem;
+      line-height: 1.6;
+    }
+
+    .note {
+      background: var(--brand-soft);
+      border-left: 4px solid var(--brand);
+    }
+
+    .tip {
+      background: #f0f9ff;
+      border-left: 4px solid #0284c7;
+    }
+
+    .tip strong, .note strong, .warn-box strong, .dont-box strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .warn-box {
+      background: var(--warning-bg);
+      border-left: 4px solid #dba617;
+    }
+
+    .dont-box {
+      background: var(--danger-bg);
+      border-left: 4px solid var(--danger);
+    }
+
+    .steps {
+      counter-reset: step;
+      list-style: none;
+      margin: 20px 0 24px;
+    }
+
+    .steps li {
+      counter-increment: step;
+      position: relative;
+      padding-left: 44px;
+      margin-bottom: 18px;
+    }
+
+    .steps li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0; top: 2px;
+      width: 28px; height: 28px;
+      background: var(--brand);
+      color: #fff;
+      border-radius: 50%;
+      font-size: 0.8rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .steps li strong { color: var(--text); }
+
+    .do-dont {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 22px 0;
+    }
+
+    .do-dont > div {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+    }
+
+    .do-dont h4 { margin-top: 0; }
+
+    .do-dont ul { margin-bottom: 0; font-size: 0.95rem; }
+
+    .do-dont .do h4 { color: var(--brand-dark); }
+    .do-dont .dont h4 { color: var(--danger); }
+
+    details.faq {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+
+    details.faq summary {
+      padding: 14px 18px;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    details.faq summary::-webkit-details-marker { display: none; }
+
+    details.faq summary::after {
+      content: "+";
+      color: var(--brand);
+      font-size: 1.2rem;
+      font-weight: 400;
+    }
+
+    details.faq[open] summary::after { content: "−"; }
+
+    details.faq .faq-body {
+      padding: 0 18px 16px;
+      color: var(--muted);
+      font-size: 0.96rem;
+      line-height: 1.65;
+    }
+
+    .glossary dl { margin: 16px 0; }
+
+    .glossary dt {
+      font-weight: 600;
+      color: var(--brand-dark);
+      margin-top: 16px;
+    }
+
+    .glossary dt:first-child { margin-top: 0; }
+
+    .glossary dd {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.96rem;
+    }
+
+    .path {
+      display: inline-block;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px;
+      font-size: 0.88rem;
+      color: var(--muted);
+      background: var(--surface);
+    }
+
+    footer .inner {
+      max-width: calc(var(--sidebar) + var(--content) + 72px);
+      margin: 0 auto;
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; gap: 24px; padding: 24px 18px 56px; }
+      .sidebar { position: static; }
+      .sidebar-inner { max-height: none; }
+      nav.toc {
+        flex-direction: row;
+        flex-wrap: wrap;
+        padding: 0 10px 6px;
+        gap: 4px;
+      }
+      nav.toc a {
+        padding: 6px 11px;
+        border-left: none;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        background: var(--bg);
+        border: 1px solid var(--border);
+      }
+      nav.toc a.active { background: var(--brand); color: #fff; border-color: var(--brand); }
+      .card-grid, .do-dont { grid-template-columns: 1fr; }
+      header { padding: 28px 18px; }
+      header h1 { font-size: 1.65rem; }
+      body { font-size: 16px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div class="brand-bar" aria-hidden="true"></div>
+    <h1>Staging to Live Sync</h1>
+    <p class="lead">A simple guide for content editors and site managers. Learn how to move your work from a test website to your live website — safely and confidently.</p>
+    <div class="meta">
+      <span>User guide</span>
+      <span>No coding required</span>
+      <span>Version 1.0.0</span>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+
+  <aside class="sidebar" aria-label="Table of contents">
+    <div class="sidebar-inner">
+      <div class="sidebar-label">Contents</div>
+      <nav class="toc">
+        <a href="#what-is-this">What is this?</a>
+        <a href="#two-sites">Two websites explained</a>
+        <a href="#before-you-start">Before you start</a>
+        <a href="#first-time-setup">First-time setup</a>
+        <a href="#daily-workflow">Your daily workflow</a>
+        <a href="#sync-a-page">Syncing a page or post</a>
+        <a href="#settings">Settings explained</a>
+        <a href="#file-sync">Syncing theme files</a>
+        <a href="#acf-sync">Custom fields (ACF)</a>
+        <a href="#logs">Activity logs</a>
+        <a href="#best-practices">Do's &amp; don'ts</a>
+        <a href="#troubleshooting">When something goes wrong</a>
+        <a href="#faq">Common questions</a>
+        <a href="#glossary">Glossary</a>
+        <a href="#get-help">When to ask for help</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+
+    <!-- WHAT IS THIS -->
+    <section id="what-is-this">
+      <h2>What is this plugin?</h2>
+      <p><strong>Staging to Live Sync</strong> (called <strong>STLS</strong> in your WordPress menu) helps you copy content from your <strong>staging site</strong> (where you make changes) to your <strong>live site</strong> (what your visitors see).</p>
+      <p>Think of it like copying a finished document from your draft folder to the published folder — except it happens with one click, and it also brings along images, custom fields, and page layout data.</p>
+
+      <div class="card-grid">
+        <div class="card">
+          <strong>Who is this for?</strong>
+          <span>Content editors, marketing teams, and site managers who update pages on a staging site and need to publish them to production.</span>
+        </div>
+        <div class="card">
+          <strong>What can you sync?</strong>
+          <span>Pages, posts, custom content types, images, SEO settings, custom fields, and (with help) theme files.</span>
+        </div>
+        <div class="card">
+          <strong>Where do you work?</strong>
+          <span>Always on your <strong>staging site</strong>. You never edit live content directly through this plugin.</span>
+        </div>
+        <div class="card">
+          <strong>Where is the plugin?</strong>
+          <span>In WordPress, look for <span class="path">STLS Sync</span> in the left sidebar menu (refresh icon).</span>
+        </div>
+      </div>
+
+      <span class="screenshot-label">Screenshot — WordPress admin</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/01-menu.png" alt="STLS Sync menu highlighted in the WordPress admin sidebar" loading="lazy" />
+        <figcaption><strong>Find STLS Sync</strong> in the left sidebar of WordPress. It has sub-pages: Settings, Logs, File Sync, ACF Field Sync, and MCP.</figcaption>
+      </figure>
+    </section>
+
+    <!-- TWO SITES -->
+    <section id="two-sites">
+      <h2>Understanding your two websites</h2>
+      <p>Most professional WordPress setups use two copies of the same website:</p>
+
+      <table>
+        <thead><tr><th>Site</th><th>What it is</th><th>Who sees it</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Staging site</strong></td>
+            <td>A private copy where you draft, edit, and preview changes. Often has a different web address (e.g. staging.yoursite.com).</td>
+            <td>You and your team only</td>
+          </tr>
+          <tr>
+            <td><strong>Live site</strong></td>
+            <td>The real, public website. This is what appears in Google and what customers visit.</td>
+            <td>Everyone on the internet</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="tip">
+        <strong>Simple analogy</strong>
+        Staging is like a rehearsal stage. Live is the actual performance. STLS is the tool that moves your finished work from rehearsal to the real show.
+      </div>
+
+      <h3>Important rules to remember</h3>
+      <ul>
+        <li><strong>Always edit on staging</strong>, then sync to live. Don't make content changes directly on the live site if you use this workflow.</li>
+        <li><strong>Sync only goes one direction</strong> — from staging to live. It does not pull changes back from live to staging.</li>
+        <li><strong>Both sites need the plugin installed.</strong> Your developer or host usually handles this during setup.</li>
+      </ul>
+    </section>
+
+    <!-- BEFORE YOU START -->
+    <section id="before-you-start">
+      <h2>Before you start</h2>
+      <p>Make sure these things are ready. If any are missing, ask your developer or site administrator.</p>
+
+      <ol class="steps">
+        <li><strong>Log into your staging site</strong> — not the live site. Check the web address in your browser to confirm you're on staging.</li>
+        <li><strong>Confirm STLS Sync appears</strong> in the left WordPress menu. If you don't see it, the plugin may not be activated.</li>
+        <li><strong>Know both website addresses</strong> — your staging URL and your live URL (e.g. https://staging.example.com and https://www.example.com).</li>
+        <li><strong>Have your Live API Key ready</strong> — a password-like code that lets staging talk securely to live. Your developer may have set this up already.</li>
+        <li><strong>Save your work first</strong> — always click Update or Publish on your page before syncing, so the latest version is sent to live.</li>
+      </ol>
+
+      <div class="warn-box">
+        <strong>Are you on the right site?</strong>
+        If you try to sync while logged into the live site, it won't work. The Sync button only appears on staging. When in doubt, check the URL in your browser bar or ask your team which site is which.
+      </div>
+    </section>
+
+    <!-- FIRST TIME SETUP -->
+    <section id="first-time-setup">
+      <h2>First-time setup</h2>
+      <p>This is usually done once by you or your developer. Go to <span class="path">STLS Sync → Settings</span> on <strong>both</strong> websites.</p>
+
+      <h3>Step 1 — On your live website</h3>
+      <ol class="steps">
+        <li>Log into WordPress on your <strong>live</strong> site.</li>
+        <li>Click <span class="path">STLS Sync → Settings</span> in the left menu.</li>
+        <li>In <strong>Live URL</strong>, enter your live website address (the one visitors use).</li>
+        <li>In <strong>Staging URL</strong>, enter your staging website address.</li>
+        <li>Next to <strong>Live API Key</strong>, click <strong>Generate</strong> to create a secure key.</li>
+        <li>Click <strong>Copy</strong> and save this key somewhere safe (a password manager or secure note).</li>
+        <li>Under <strong>Page builder</strong>, select the tool you use to build pages (ACF Gutenberg, Elementor, or WPBakery).</li>
+        <li>Click <strong>Save Settings</strong> at the bottom of the page.</li>
+      </ol>
+
+      <h3>Step 2 — On your staging website</h3>
+      <ol class="steps">
+        <li>Log into WordPress on your <strong>staging</strong> site.</li>
+        <li>Click <span class="path">STLS Sync → Settings</span>.</li>
+        <li>Enter the same <strong>Staging URL</strong> and <strong>Live URL</strong> as above.</li>
+        <li>Paste the <strong>exact same Live API Key</strong> you copied from the live site. It must match character for character.</li>
+        <li>Select the same <strong>Page builder</strong> option.</li>
+        <li>If you plan to sync theme files, scroll down and check the themes/plugins you want to appear under File Sync.</li>
+        <li>Click <strong>Save Settings</strong>.</li>
+      </ol>
+
+      <span class="screenshot-label">Screenshot — Settings page</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/02-settings-urls.png" alt="STLS Settings showing Staging URL, Live URL, and Live API Key fields" loading="lazy" />
+        <figcaption><strong>Enter your website addresses</strong> and set up the Live API Key. Generate the key on live, copy it, then paste the same key on staging. Click Save Settings on both sites.</figcaption>
+      </figure>
+
+      <span class="screenshot-label">Screenshot — Page builder &amp; SFTP</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/03-settings-sftp.png" alt="STLS Settings showing page builder selection and SFTP fallback options" loading="lazy" />
+        <figcaption><strong>Choose your page builder</strong> (ACF Gutenberg, Elementor, or WPBakery). If your developer set up WP Engine hosting, SFTP options appear here for theme file uploads.</figcaption>
+      </figure>
+
+      <div class="note">
+        <strong>What is a Live API Key?</strong>
+        It's a long random password that proves your staging site is allowed to send content to your live site. You don't need to memorise it — just copy and paste it once during setup. Never share it publicly.
+      </div>
+    </section>
+
+    <!-- DAILY WORKFLOW -->
+    <section id="daily-workflow">
+      <h2>Your daily workflow</h2>
+      <p>Once setup is complete, this is the routine you'll follow every time you publish changes:</p>
+
+      <ol class="steps">
+        <li><strong>Log into staging</strong> — open your staging website in the browser.</li>
+        <li><strong>Edit your page or post</strong> — make your text, image, and layout changes as usual.</li>
+        <li><strong>Save or update</strong> — click Update or Publish so your changes are saved on staging.</li>
+        <li><strong>Preview on staging</strong> — view the page on staging to make sure it looks correct.</li>
+        <li><strong>Sync to live</strong> — go to the Posts or Pages list and click Sync (see next section).</li>
+        <li><strong>Check the live site</strong> — open the same page on your live website and confirm it looks right.</li>
+      </ol>
+
+      <div class="tip">
+        <strong>Pro tip</strong>
+        After syncing, always spot-check the live page in your browser — especially images, forms, and links. A quick visual check catches most issues immediately.
+      </div>
+
+      <span class="screenshot-label">Screenshot — Your main action</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/04-pages-sync.png" alt="Daily workflow: click Sync under a page in the WordPress Pages list" loading="lazy" />
+        <figcaption>This is the button you'll use most often — <strong>Sync</strong> under any page or post on staging, after you've saved your changes.</figcaption>
+      </figure>
+    </section>
+
+    <!-- SYNC A PAGE -->
+    <section id="sync-a-page">
+      <h2>Syncing a page or post</h2>
+      <p>This is the most common task you'll perform. It copies one page (or post) from staging to live.</p>
+
+      <h3>How to sync</h3>
+      <ol class="steps">
+        <li>On staging, go to <span class="path">Pages → All Pages</span> (or Posts, or your custom content type).</li>
+        <li>Find the page you want to publish. Hover over its title.</li>
+        <li>Click the green <strong>Sync</strong> link that appears below the title (next to Edit, Quick Edit, Trash).</li>
+        <li>Wait a few seconds. You'll see a success or error message.</li>
+        <li>Visit the live site and check the page.</li>
+      </ol>
+
+      <span class="screenshot-label">Screenshot — Pages list</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/04-pages-sync.png" alt="WordPress Pages list with Sync link highlighted under page title row actions" loading="lazy" />
+        <figcaption><strong>Hover over a page title</strong> to reveal row actions. Click the green <strong>Sync</strong> link to send that page to your live site. This only appears on staging.</figcaption>
+      </figure>
+
+      <h3>What gets copied to live?</h3>
+      <p>When you sync a page, STLS sends much more than just the text. Here's everything included:</p>
+
+      <table>
+        <thead><tr><th>What</th><th>Plain English</th></tr></thead>
+        <tbody>
+          <tr><td>Page title &amp; content</td><td>The headline, body text, and excerpt</td></tr>
+          <tr><td>Page status</td><td>Whether it's published, draft, etc.</td></tr>
+          <tr><td>Featured image</td><td>The main image shown with the page</td></tr>
+          <tr><td>Images in the page</td><td>Photos and graphics inside your content — they're copied to the live media library</td></tr>
+          <tr><td>Custom fields (ACF)</td><td>Extra content areas your developer set up — hero text, icons, repeater lists, etc.</td></tr>
+          <tr><td>Page builder layout</td><td>Blocks, Elementor sections, or WPBakery content — depending on your setup</td></tr>
+          <tr><td>Categories &amp; tags</td><td>Any labels assigned to the page</td></tr>
+          <tr><td>SEO settings</td><td>Yoast SEO title and description, if you use Yoast</td></tr>
+        </tbody>
+      </table>
+
+      <div class="warn-box">
+        <strong>Syncing replaces live content</strong>
+        When you sync a page that already exists on live, the live version is updated with what's on staging. If someone edited the live page directly, those changes will be overwritten. Stick to editing on staging only.
+      </div>
+
+      <h3>If the Sync button doesn't appear</h3>
+      <ul>
+        <li>You might be on the live site instead of staging — check your browser URL.</li>
+        <li>Settings may not be saved — go to STLS Sync → Settings and confirm URLs and API key are filled in.</li>
+        <li>That content type might be disabled — check Settings → Disable Sync for Post Types.</li>
+      </ul>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="settings">
+      <h2>Settings explained</h2>
+      <p>All plugin settings are under <span class="path">STLS Sync → Settings</span>. Here's what each option means in everyday language.</p>
+
+      <table>
+        <thead><tr><th>Setting</th><th>What it does</th><th>Who fills it in</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Staging URL</strong></td>
+            <td>The full web address of your staging site (starts with https://).</td>
+            <td>You or your developer</td>
+          </tr>
+          <tr>
+            <td><strong>Live URL</strong></td>
+            <td>The full web address of your public live site.</td>
+            <td>You or your developer</td>
+          </tr>
+          <tr>
+            <td><strong>Live API Key</strong></td>
+            <td>The security password connecting both sites. Must be identical on staging and live.</td>
+            <td>Generate once, copy to both sites</td>
+          </tr>
+          <tr>
+            <td><strong>Page builder</strong></td>
+            <td>Tells the plugin how your pages are built — ACF Gutenberg (default), Elementor, or WPBakery. Pick the one your site uses.</td>
+            <td>You or your developer</td>
+          </tr>
+          <tr>
+            <td><strong>Disable Sync for Post Types</strong></td>
+            <td>Hides the Sync button for specific content types you don't want synced (e.g. internal notes).</td>
+            <td>Optional — you</td>
+          </tr>
+          <tr>
+            <td><strong>File Sync: Themes &amp; Plugins</strong></td>
+            <td>Choose which theme and plugin folders appear on the File Sync page.</td>
+            <td>Developer usually</td>
+          </tr>
+          <tr>
+            <td><strong>SFTP Fallback</strong></td>
+            <td>For hosts like WP Engine that block direct file writes. Lets the plugin upload theme files another way.</td>
+            <td>Developer / host admin</td>
+          </tr>
+          <tr>
+            <td><strong>Debugger emails</strong></td>
+            <td Sends an email alert if the website crashes. Useful for developers monitoring the site.</td>
+            <td>Developer</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Choosing your page builder</h3>
+      <p>Your developer will tell you which page builder your site uses. Select the matching option:</p>
+      <ul>
+        <li><strong>ACF Gutenberg</strong> — Default. Use this if you edit pages with the WordPress block editor and custom ACF blocks.</li>
+        <li><strong>Elementor</strong> — Use if you build pages with Elementor. Both sites must run the same Elementor version.</li>
+        <li><strong>WPBakery</strong> — Use if your site uses WPBakery Page Builder.</li>
+      </ul>
+
+      <span class="screenshot-label">Screenshot — STLS menu overview</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/01-menu.png" alt="STLS Sync submenu showing Settings, Logs, File Sync, ACF Field Sync, and MCP" loading="lazy" />
+        <figcaption><strong>STLS Sync submenu:</strong> Settings (setup), Logs (history), File Sync (theme files), ACF Field Sync (custom fields), and MCP (AI tools — usually for developers).</figcaption>
+      </figure>
+    </section>
+
+    <!-- FILE SYNC -->
+    <section id="file-sync">
+      <h2>Syncing theme files</h2>
+      <p>Sometimes your developer changes theme files (templates, styles, code) on staging and needs to copy those to live. This is different from syncing a page — it moves actual website files.</p>
+
+      <div class="note">
+        <strong>Is this for you?</strong>
+        Most content editors only need page sync. File sync is typically used by developers or agencies updating the site's design or functionality. If you're unsure, ask before syncing files.
+      </div>
+
+      <h3>How file sync works (simple version)</h3>
+      <ol class="steps">
+        <li>Your developer selects which theme/plugin folders to show — under <span class="path">STLS Sync → Settings</span>.</li>
+        <li>Go to <span class="path">STLS Sync → File Sync</span> on staging.</li>
+        <li>Click folders to expand them and browse files (like a file explorer).</li>
+        <li>Check the boxes next to the files you want to copy to live.</li>
+        <li>Click <strong>Sync Files</strong> and wait for the progress message.</li>
+      </ol>
+
+      <h3>WP Engine and managed hosting</h3>
+      <p>Some web hosts (like WP Engine) don't allow files to be written directly into theme folders for security. STLS handles this automatically:</p>
+      <ul>
+        <li>The file is first saved to a temporary folder on live.</li>
+        <li>Then it's uploaded to the correct location using SFTP (a secure file transfer method).</li>
+      </ul>
+
+      <span class="screenshot-label">Screenshot — File Sync page</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/05-file-sync.png" alt="STLS File Sync page showing theme file tree with checkboxes and Sync Files button" loading="lazy" />
+        <figcaption><strong>Browse theme folders</strong>, check the files you want, then click <strong>Sync Files</strong>. Expand folders by clicking them. Use search to find a specific file quickly.</figcaption>
+      </figure>
+
+      <p>If files couldn't be uploaded automatically (common on WP Engine), you'll see a yellow notice in Settings with an <strong>Apply Queued Files via SFTP</strong> button. Click it to retry, or ask your developer for help.</p>
+    </section>
+
+    <!-- ACF -->
+    <section id="acf-sync">
+      <h2>Custom fields (ACF)</h2>
+      <p>Many websites use a plugin called <strong>Advanced Custom Fields (ACF)</strong> to add extra content areas to pages — things like icon lists, hero banners, team member cards, or repeater sections. These are called <strong>field groups</strong>.</p>
+
+      <h3>Why field groups matter</h3>
+      <p>Before you sync pages that use custom fields, the field group definitions must exist on both staging and live. If live is missing a field group, the content may appear empty after sync.</p>
+
+      <h3>How to sync field groups</h3>
+      <ol class="steps">
+        <li>On staging, go to <span class="path">STLS Sync → ACF Field Sync</span>.</li>
+        <li>Click <strong>Refresh comparison</strong>. This checks what's on live vs staging.</li>
+        <li>Look at the status column:
+          <ul style="margin-top:8px">
+            <li><strong>Missing on live</strong> — the field group doesn't exist on live yet. Sync it.</li>
+            <li><strong>Out of date</strong> — live has an older version. Sync to update.</li>
+            <li><strong>In sync</strong> — everything matches. No action needed.</li>
+          </ul>
+        </li>
+        <li>Click <strong>Sync</strong> next to any field group that needs updating.</li>
+        <li>After field groups are in sync, sync your pages as usual.</li>
+      </ol>
+
+      <span class="screenshot-label">Screenshot — ACF Field Sync</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/06-acf-sync.png" alt="ACF Field Sync page showing field groups with Missing on live, Updated on Staging, and In sync statuses" loading="lazy" />
+        <figcaption><strong>Click Refresh comparison</strong> to check live. Red rows = missing on live. Yellow = updated on staging. Green = already in sync. Click <strong>Sync</strong> on any row that needs updating.</figcaption>
+      </figure>
+
+      <div class="tip">
+        <strong>When to do this</strong>
+        Sync field groups whenever your developer adds or changes custom fields on staging — before syncing the pages that use those fields.
+      </div>
+    </section>
+
+    <!-- LOGS -->
+    <section id="logs">
+      <h2>Activity logs</h2>
+      <p>STLS keeps a record of every sync so you can see what was sent and when. Go to <span class="path">STLS Sync → Logs</span>.</p>
+
+      <table>
+        <thead><tr><th>Column</th><th>What it tells you</th></tr></thead>
+        <tbody>
+          <tr><td><strong>User</strong></td><td>Who performed the sync (your name, or "Sync via MCP" if an AI tool did it)</td></tr>
+          <tr><td><strong>Page/Post Name</strong></td><td>Which page or item was synced — click to edit it</td></tr>
+          <tr><td><strong>Post Type</strong></td><td>Whether it was a Page, Post, File sync, or ACF Field Group</td></tr>
+          <tr><td><strong>Time</strong></td><td>When the sync happened</td></tr>
+        </tbody>
+      </table>
+
+      <span class="screenshot-label">Screenshot — Activity Logs</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/07-logs.png" alt="STLS Activity Logs showing sync history with user, page name, post type, and time" loading="lazy" />
+        <figcaption><strong>Every sync is recorded.</strong> See who synced what and when. Useful if you need to check whether a page was already sent to live, or to share details with your developer.</figcaption>
+      </figure>
+
+      <p>Logs are automatically deleted after a set number of days (default: 30). You can change this at the top of the Logs page. Use <strong>Clear All Logs</strong> to remove the history manually.</p>
+
+      <h3>AI sync (optional)</h3>
+      <p>If your team uses AI tools like Cursor, developers can enable MCP sync. This is separate from the normal Sync button — you don't need it for everyday page publishing.</p>
+
+      <span class="screenshot-label">Screenshot — MCP page</span>
+      <figure class="screenshot">
+        <img src="documentation/assets/screenshots/08-mcp.png" alt="STLS MCP settings page showing Enable MCP sync checkbox and available commands" loading="lazy" />
+        <figcaption><strong>MCP is for developers.</strong> It lets AI assistants sync pages from staging. Your regular Sync button works independently and doesn't require this.</figcaption>
+      </figure>
+    </section>
+
+    <!-- BEST PRACTICES -->
+    <section id="best-practices">
+      <h2>Do's &amp; don'ts</h2>
+
+      <div class="do-dont">
+        <div class="do">
+          <h4>Do</h4>
+          <ul>
+            <li>Edit and preview on staging first</li>
+            <li>Save your page before syncing</li>
+            <li>Check the live page after every sync</li>
+            <li>Sync ACF field groups before syncing pages that use them</li>
+            <li>Keep the same plugin version on both sites</li>
+            <li>Ask your developer if you're unsure about file sync</li>
+          </ul>
+        </div>
+        <div class="dont">
+          <h4>Don't</h4>
+          <ul>
+            <li>Edit content directly on the live site (if you use this workflow)</li>
+            <li>Sync from the live site — it only works from staging</li>
+            <li>Share your Live API Key publicly</li>
+            <li>Sync files unless you know what they do</li>
+            <li>Assume sync worked without checking live</li>
+            <li>Skip saving — always Update/Publish before Sync</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- TROUBLESHOOTING -->
+    <section id="troubleshooting">
+      <h2>When something goes wrong</h2>
+      <p>If sync fails, you'll usually see an error message on screen. Here's what common messages mean and what you can try.</p>
+
+      <table>
+        <thead><tr><th>What you see</th><th>What it means</th><th>What to try</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Sync button is missing</strong></td>
+            <td>The plugin doesn't think you're on staging, or settings aren't complete.</td>
+            <td>Confirm you're logged into staging. Check Settings has both URLs and the API key filled in.</td>
+          </tr>
+          <tr>
+            <td><strong>Invalid API key</strong></td>
+            <td>The security key on staging doesn't match live.</td>
+            <td>On live, copy the Live API Key. Paste it into staging Settings. Save on both sites.</td>
+          </tr>
+          <tr>
+            <td><strong>No route found</strong></td>
+            <td>Live site may not have the plugin active or updated.</td>
+            <td>Ask your developer to confirm the plugin is active on live and both sites use the same version.</td>
+          </tr>
+          <tr>
+            <td><strong>Images missing on live</strong></td>
+            <td>Live couldn't download images from staging.</td>
+            <td>Make sure staging is accessible from the internet (not blocked by a login wall). Ask your developer.</td>
+          </tr>
+          <tr>
+            <td><strong>Custom fields empty</strong></td>
+            <td>Field groups may not exist on live yet.</td>
+            <td>Go to ACF Field Sync, refresh comparison, and sync the missing field groups first.</td>
+          </tr>
+          <tr>
+            <td><strong>File sync failed</strong></td>
+            <td>Live couldn't write the file directly (common on WP Engine).</td>
+            <td>Enable SFTP in Settings or click Apply Queued Files via SFTP. Contact your developer.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="tip">
+        <strong>Still stuck?</strong>
+        Take a screenshot of the error message and note which page you were syncing. Share this with your developer — the Activity Logs page also helps them diagnose the issue.
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section id="faq">
+      <h2>Common questions</h2>
+
+      <details class="faq">
+        <summary>Does syncing delete anything on live?</summary>
+        <div class="faq-body">No. Syncing updates or creates the specific page you chose. It does not delete other pages or content on live. However, if the page already exists on live, its content will be replaced with what's on staging.</div>
+      </details>
+
+      <details class="faq">
+        <summary>Can I sync multiple pages at once?</summary>
+        <div class="faq-body">The Sync button works one page at a time from the page list. For bulk syncing, your developer may use additional tools or AI sync (MCP). Ask your team if you need to sync many pages regularly.</div>
+      </details>
+
+      <details class="faq">
+        <summary>Will my page look exactly the same on live?</summary>
+        <div class="faq-body">It should, if both sites use the same theme, plugins, and field groups. Always preview on live after syncing. Small differences can happen if live is missing a plugin or has different settings.</div>
+      </details>
+
+      <details class="faq">
+        <summary>Do I need to sync every time I make a small edit?</summary>
+        <div class="faq-body">Yes. Changes on staging stay on staging until you sync. Even a typo fix needs a sync to appear on live (after you save the page).</div>
+      </details>
+
+      <details class="faq">
+        <summary>What if I accidentally sync the wrong page?</summary>
+        <div class="faq-body">The live page will show whatever was on staging. If you have a backup or revision, your developer can restore it. Going forward, double-check the page title before clicking Sync.</div>
+      </details>
+
+      <details class="faq">
+        <summary>Is my Live API Key like a password?</summary>
+        <div class="faq-body">Yes — treat it like one. Don't post it in emails, chat, or public documents. Only paste it into the STLS Settings on your staging and live sites.</div>
+      </details>
+
+      <details class="faq">
+        <summary>What's MCP / AI sync?</summary>
+        <div class="faq-body">MCP lets AI tools (like Cursor) sync pages on your behalf. This is optional and usually set up by developers. Your normal Sync button works independently — you don't need MCP for everyday use.</div>
+      </details>
+    </section>
+
+    <!-- GLOSSARY -->
+    <section id="glossary">
+      <h2>Glossary</h2>
+      <p>Quick definitions for terms you might see in this guide or in WordPress.</p>
+
+      <div class="glossary">
+        <dl>
+          <dt>Staging site</dt>
+          <dd>A private copy of your website used for editing and testing before going live.</dd>
+
+          <dt>Live site</dt>
+          <dd>Your public website — the one visitors and search engines see.</dd>
+
+          <dt>Sync</dt>
+          <dd>Copying content from staging to live with one action.</dd>
+
+          <dt>Live API Key</dt>
+          <dd>A secret code that allows staging to send content to live securely. Must match on both sites.</dd>
+
+          <dt>ACF (Advanced Custom Fields)</dt>
+          <dd>A WordPress plugin that adds extra content fields to pages — like icons, banners, or structured data.</dd>
+
+          <dt>Field group</dt>
+          <dd>A collection of custom fields in ACF (e.g. "Hero Section" or "Team Members").</dd>
+
+          <dt>Custom post type</dt>
+          <dd>A special kind of content beyond regular pages and posts — like Events, Products, or Case Studies.</dd>
+
+          <dt>Theme files</dt>
+          <dd>The design and template files that control how your website looks and behaves.</dd>
+
+          <dt>SFTP</dt>
+          <dd>A secure way to upload files to a web server. Used when direct file writing isn't allowed.</dd>
+
+          <dt>WP Engine</dt>
+          <dd>A popular managed WordPress hosting company with extra security restrictions on file access.</dd>
+
+          <dt>Page builder</dt>
+          <dd>The tool used to design pages — ACF Gutenberg blocks, Elementor, or WPBakery.</dd>
+        </dl>
+      </div>
+    </section>
+
+    <!-- GET HELP -->
+    <section id="get-help">
+      <h2>When to ask for help</h2>
+      <p>You can handle day-to-day page syncing yourself. Contact your developer or site administrator when:</p>
+
+      <ul>
+        <li>First-time setup hasn't been done yet</li>
+        <li>You see error messages you don't understand (especially API key or "route not found" errors)</li>
+        <li>You need to sync theme files or change SFTP settings</li>
+        <li>Custom fields or images aren't appearing on live after sync</li>
+        <li>The plugin needs to be installed, updated, or activated on either site</li>
+        <li>You need bulk syncing or AI/MCP integration set up</li>
+      </ul>
+
+      <div class="note">
+        <strong>What to send your developer</strong>
+        Include: which site you're on (staging or live), the page you tried to sync, a screenshot of any error message, and the time it happened. The STLS Sync → Logs page is also helpful.
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="inner">
+    <p>Staging to Live Sync · User Guide · York IE · <a href="https://york.ie">york.ie</a></p>
+    <p style="margin-top:8px">Open this file in any browser. For technical/API documentation, contact your development team.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var links = document.querySelectorAll('nav.toc a');
+  var sections = [];
+
+  links.forEach(function (link) {
+    var id = link.getAttribute('href').slice(1);
+    var section = document.getElementById(id);
+    if (section) sections.push({ link: link, section: section });
+  });
+
+  function setActive(id) {
+    links.forEach(function (link) {
+      link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+    });
+  }
+
+  if ('IntersectionObserver' in window && sections.length) {
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) setActive(entry.target.id);
+      });
+    }, { rootMargin: '-15% 0px -55% 0px', threshold: 0 });
+
+    sections.forEach(function (item) { observer.observe(item.section); });
+  }
+
+  links.forEach(function (link) {
+    link.addEventListener('click', function (e) {
+      e.preventDefault();
+      var target = document.querySelector(link.getAttribute('href'));
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        setActive(target.id);
+        history.replaceState(null, '', link.getAttribute('href'));
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

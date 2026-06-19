@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>02 Settings URLs</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap">
+          <h1>Staging to Live Sync</h1>
+          <table class="form-table">
+            <tr>
+              <th><label>Staging URL</label></th>
+              <td>
+                <input type="url" class="regular-text highlight-ring" value="https://staging.example.com" readonly />
+                <p class="description">Enter the full URL of your staging site (e.g., https://staging.example.com)</p>
+              </td>
+            </tr>
+            <tr>
+              <th><label>Live URL</label></th>
+              <td>
+                <input type="url" class="regular-text highlight-ring" value="https://www.example.com" readonly />
+                <p class="description">Enter the full URL of your live site (e.g., https://example.com)</p>
+              </td>
+            </tr>
+            <tr>
+              <th><label>Live API Key (Optional)</label></th>
+              <td>
+                <div class="stls-api-key-wrapper highlight-ring" style="padding:8px;display:inline-flex;">
+                  <input type="text" class="regular-text stls-api-key-input" value="stls_a8f3k9m2x7p1q4w6e8r0t5y2u" readonly />
+                  <button type="button" class="button">Generate</button>
+                  <button type="button" class="button">Copy</button>
+                </div>
+                <p class="description">Required for sync to live. Generate one key, paste the same value in Live API Key on BOTH staging and live sites, then save on each.</p>
+              </td>
+            </tr>
+          </table>
+          <p><button type="button" class="button button-primary">Save Settings</button></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

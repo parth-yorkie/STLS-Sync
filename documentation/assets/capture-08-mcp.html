@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>08 MCP</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap">
+          <h1>MCP</h1>
+          <div class="notice notice-success inline"><p>MCP sync is ready. Connect WordPress MCP in Cursor to this staging site.</p></div>
+          <table class="form-table">
+            <tr>
+              <th>MCP Integration</th>
+              <td>
+                <label><input type="checkbox" checked /> Enable MCP sync</label>
+                <p class="description">When disabled, MCP tools are blocked. Admin sync buttons are not affected.</p>
+                <p><strong>Status:</strong> <span style="color:#00a32a;">Enabled</span></p>
+              </td>
+            </tr>
+          </table>
+          <h2 style="font-size:18px;margin:24px 0 12px;font-weight:600;">MCP Commands</h2>
+          <table class="widefat striped">
+            <thead><tr><th>Command</th><th>Tool Name</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>Sync and Live Configuration</strong></td>
+                <td><code>stls_sync_config</code></td>
+                <td>Read</td>
+                <td>Check URLs, API key status, and whether sync is ready</td>
+              </tr>
+              <tr>
+                <td><strong>Sync to Live</strong></td>
+                <td><code>stls_sync_to_live</code></td>
+                <td>Action</td>
+                <td>Push a post from staging to the live site</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>07 Logs</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap">
+          <h1>Activity Logs</h1>
+          <p style="margin-bottom:16px;">
+            Clear logs after <input value="30" style="width:50px;padding:4px;" /> days
+            <button class="button">Save Retention</button>
+            <button class="button" style="margin-left:8px;">Clear All Logs</button>
+            <span style="color:#666;margin-left:12px;">Total log entries: 24</span>
+          </p>
+          <table class="widefat striped">
+            <thead>
+              <tr><th>ID</th><th>User</th><th>Page/Post Name</th><th>Post Type</th><th>Time</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>24</td>
+                <td>Jane Smith<br><small style="color:#666;">jane@example.com</small></td>
+                <td><a href="#">About Us</a></td>
+                <td>Page</td>
+                <td>Jun 9, 2026 2:34 pm</td>
+              </tr>
+              <tr>
+                <td>23</td>
+                <td>Jane Smith</td>
+                <td><a href="#">Home</a></td>
+                <td>Page</td>
+                <td>Jun 9, 2026 11:15 am</td>
+              </tr>
+              <tr>
+                <td>22</td>
+                <td>Sync via MCP<br><small style="color:#666;">AI assistant</small></td>
+                <td>Services</td>
+                <td>Page</td>
+                <td>Jun 8, 2026 4:02 pm</td>
+              </tr>
+              <tr>
+                <td>21</td>
+                <td>Dev Team</td>
+                <td>Hero Section</td>
+                <td>ACF Field Group</td>
+                <td>Jun 8, 2026 9:20 am</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

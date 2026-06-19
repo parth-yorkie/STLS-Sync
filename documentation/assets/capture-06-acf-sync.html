@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>06 ACF Field Sync</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap stls-acf-sync">
+          <h1>ACF Field Sync</h1>
+          <p class="description">Compare field groups on staging with live, then sync individual groups.</p>
+          <p style="margin:16px 0;">
+            <button class="button button-primary highlight-ring">Refresh comparison</button>
+            <span style="margin-left:12px;color:#50575e;">3 missing on live · 1 updated on staging · 5 in sync</span>
+          </p>
+          <table class="widefat striped">
+            <thead>
+              <tr>
+                <th>Field group title</th>
+                <th>Key</th>
+                <th>Status</th>
+                <th>Sync to live</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="stls-acf-missing">
+                <td><a href="#">Hero Section</a></td>
+                <td><code>group_hero</code></td>
+                <td class="status-miss">Missing on live</td>
+                <td><button class="button">Sync</button></td>
+              </tr>
+              <tr class="stls-acf-differs">
+                <td><a href="#">Team Members</a></td>
+                <td><code>group_team</code></td>
+                <td class="status-diff">Updated on Staging</td>
+                <td><button class="button">Sync</button></td>
+              </tr>
+              <tr>
+                <td><a href="#">Page Settings</a></td>
+                <td><code>group_page</code></td>
+                <td class="status-ok">In sync with live</td>
+                <td><button class="button">Sync</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

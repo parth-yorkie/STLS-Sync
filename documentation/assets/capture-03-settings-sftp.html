@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>03 Settings Pagebuilder SFTP</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap">
+          <h1>Staging to Live Sync</h1>
+          <table class="form-table">
+            <tr>
+              <th>SFTP Fallback<br><small>(WP Engine)</small></th>
+              <td>
+                <label><input type="checkbox" checked /> Enable SFTP deploy when PHP cannot write theme/plugin files</label>
+                <div class="stls-sftp-security-notice highlight-ring" style="margin-top:12px;">
+                  <span>🔒</span>
+                  <span>Your SFTP credentials are safe. Host, username, and password are encrypted with AES-256 before being stored.</span>
+                </div>
+                <div class="stls-sftp-fields">
+                  <div class="stls-sftp-field"><label>SFTP Host</label><input class="regular-text" value="yoursite.sftp.wpengine.com" readonly style="width:220px" /></div>
+                  <div class="stls-sftp-field"><label>SFTP Port</label><input value="2222" readonly style="width:80px;padding:4px 8px;" /></div>
+                  <div class="stls-sftp-field"><label>SFTP Username</label><input class="regular-text" value="yoursite-staging" readonly style="width:180px" /></div>
+                </div>
+                <p style="margin-top:12px;"><button class="button">Test SFTP Connection</button></p>
+              </td>
+            </tr>
+            <tr>
+              <th>Select Pagebuilder</th>
+              <td>
+                <label style="display:block;margin-bottom:8px;"><input type="radio" name="pb" checked /> <strong>ACF Gutenberg</strong></label>
+                <label style="display:block;margin-bottom:8px;"><input type="radio" name="pb" /> <strong>Elementor</strong></label>
+                <label style="display:block;"><input type="radio" name="pb" /> <strong>WPBakery</strong></label>
+                <p class="description">Please select the page builder you are using before using the plugin.</p>
+              </td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

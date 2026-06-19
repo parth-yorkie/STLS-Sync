@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="wp-admin-mock.css" />
+  <title>05 File Sync</title>
+</head>
+<body>
+<div class="capture-root" id="capture">
+  <div class="wp-admin">
+    <div id="adminmenuwrap"><ul id="adminmenu"><li class="stls-active current"><a href="#">↻ STLS Sync</a></li></ul></div>
+    <div class="wp-content-area">
+      <div id="wpbody-content">
+        <div class="wrap">
+          <h1>File Sync</h1>
+          <div class="notice notice-info inline"><p><strong>Filtered View:</strong> Only selected themes and plugins are shown.</p></div>
+          <p class="description">Browse files in the wp-content directory. Click folders to load contents.</p>
+          <p style="margin:12px 0;"><label style="font-weight:600;">Search Files:</label>
+            <input class="regular-text" placeholder="Enter file or folder name..." style="width:320px;margin-left:8px;" />
+            <button class="button">Clear</button>
+          </p>
+          <div class="stls-file-tree highlight-ring">
+            <div class="folder">📁 themes/</div>
+            <div class="folder" style="padding-left:16px;">📁 your-theme/</div>
+            <div class="file" style="padding-left:32px;"><label><input type="checkbox" checked /> single.php</label></div>
+            <div class="file" style="padding-left:32px;"><label><input type="checkbox" /> functions.php</label></div>
+            <div class="file" style="padding-left:32px;"><label><input type="checkbox" checked /> style.css</label></div>
+            <div class="folder" style="padding-left:16px;">📁 template-parts/</div>
+            <div class="file" style="padding-left:32px;"><label><input type="checkbox" /> header.php</label></div>
+          </div>
+          <div style="margin-top:16px;padding:16px;background:#fff;border:1px solid #c3c4c7;display:flex;justify-content:space-between;align-items:center;">
+            <span><strong>2 files selected</strong></span>
+            <button class="button button-primary button-large highlight-ring">Sync Files</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
