@@ -58,6 +58,11 @@ class Staging_To_Live_Sync
 	 */
 	private function init_hooks()
 	{
+		require_once STLS_PLUGIN_DIR . 'includes/class-stls-mcp-admin.php';
+		require_once STLS_PLUGIN_DIR . 'includes/class-stls-mcp-cpt-compat.php';
+		require_once STLS_PLUGIN_DIR . 'includes/class-stls-credentials-crypto.php';
+		require_once STLS_PLUGIN_DIR . 'includes/class-stls-sftp.php';
+
 		// Activation hook
 		register_activation_hook(__FILE__, array($this, 'activate'));
 
@@ -69,9 +74,17 @@ class Staging_To_Live_Sync
 
 		// Admin settings
 		add_action('admin_init', array($this, 'register_settings'));
+		add_action('admin_init', array('STLS_Credentials_Crypto', 'maybe_migrate_legacy_options'), 5);
+		add_action('update_option_stls_log_retention_days', array($this, 'cleanup_old_logs'));
 
 		// Load pagebuilder-specific files
 		add_action('plugins_loaded', array($this, 'load_pagebuilder_files'), 20);
+
+		// WordPress MCP integration — only when STLS MCP and wordpress-mcp are both available.
+		add_action('plugins_loaded', array($this, 'maybe_hook_mcp_integration'), 25);
+
+		// Staging-side REST routes for MCP / REST clients.
+		add_action('rest_api_init', array($this, 'register_staging_rest_routes'));
 
 		// Add row actions to all post types dynamically
 		add_action('admin_init', array($this, 'add_sync_row_actions_to_all_post_types'));
@@ -83,12 +96,19 @@ class Staging_To_Live_Sync
 		add_action('wp_ajax_stls_load_directory', array($this, 'ajax_load_directory'));
 		add_action('wp_ajax_stls_compare_acf_field_groups', array($this, 'ajax_compare_acf_field_groups'));
 		add_action('wp_ajax_stls_sync_acf_field_group', array($this, 'ajax_sync_acf_field_group'));
+		add_action('wp_ajax_stls_test_sftp', array($this, 'ajax_test_sftp'));
+		add_action('wp_ajax_stls_apply_file_sync_queue', array($this, 'ajax_apply_file_sync_queue'));
 
 		// Enqueue scripts
 		add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
 
 		// Schedule log cleanup
 		add_action('stls_cleanup_old_logs', array($this, 'cleanup_old_logs'));
+
+		// Fatal error email (shutdown runs for parse/fatal errors; register early)
+		add_action('plugins_loaded', array($this, 'register_debugger_shutdown_notifier'), 1);
+		// Uncaught exceptions: register late so we wrap WP's handler and can still chain it
+		add_action('wp_loaded', array($this, 'register_debugger_exception_notifier'), 99999);
 	}
 
 	/**
@@ -115,12 +135,198 @@ class Staging_To_Live_Sync
 	}
 
 	/**
+	 * Attach to wordpress_mcp_init only when MCP tools can be registered.
+	 */
+	public function maybe_hook_mcp_integration()
+	{
+		if (!stls_mcp_can_register_tools()) {
+			return;
+		}
+
+		add_action('wordpress_mcp_init', array($this, 'register_mcp_integration'), 20);
+	}
+
+	/**
+	 * Register WordPress MCP tools (staging → live sync).
+	 */
+	public function register_mcp_integration()
+	{
+		if (!stls_mcp_can_register_tools()) {
+			return;
+		}
+
+		$mcp_file = STLS_PLUGIN_DIR . 'includes/class-stls-mcp-sync.php';
+		if (file_exists($mcp_file)) {
+			require_once $mcp_file;
+			STLS_Mcp_Sync::register_tools();
+		}
+
+		if (class_exists('STLS_Mcp_Cpt_Compat')) {
+			STLS_Mcp_Cpt_Compat::register_tools();
+		}
+	}
+
+	/**
+	 * REST permission: staging sync endpoints (logged-in editor on staging).
+	 *
+	 * @return true|WP_Error
+	 */
+	public function rest_permission_staging_sync()
+	{
+		if (!stls_is_mcp_enabled()) {
+			return new WP_Error(
+				'mcp_disabled',
+				__('STLS MCP integration is disabled. Enable it under STLS Sync → MCP.', 'staging-to-live-sync'),
+				array('status' => 403)
+			);
+		}
+
+		if (!stls_is_wordpress_mcp_active()) {
+			return new WP_Error(
+				'wordpress_mcp_inactive',
+				__('WordPress MCP plugin is not active. STLS MCP REST endpoints require it on staging.', 'staging-to-live-sync'),
+				array('status' => 503)
+			);
+		}
+
+		if (!$this->is_staging_site()) {
+			return new WP_Error(
+				'not_staging_site',
+				__('This endpoint is only available on the staging site. Connect MCP to staging, not live.', 'staging-to-live-sync'),
+				array('status' => 403)
+			);
+		}
+
+		if ($this->is_live_site()) {
+			return new WP_Error(
+				'on_live_site',
+				__('This endpoint cannot be used on the live site.', 'staging-to-live-sync'),
+				array('status' => 403)
+			);
+		}
+
+		if (!current_user_can('edit_posts')) {
+			return new WP_Error(
+				'rest_forbidden',
+				__('You do not have permission to sync posts.', 'staging-to-live-sync'),
+				array('status' => 403)
+			);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Register staging-side REST routes used by MCP (not the live-site receiver).
+	 */
+	public function register_staging_rest_routes()
+	{
+		register_rest_route(
+			'stls/v1',
+			'/sync-config',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array($this, 'rest_get_sync_config'),
+				'permission_callback' => array($this, 'rest_permission_staging_sync'),
+			)
+		);
+
+		register_rest_route(
+			'stls/v1',
+			'/sync-to-live',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array($this, 'rest_sync_to_live'),
+				'permission_callback' => array($this, 'rest_permission_staging_sync'),
+				'args'                => array(
+					'post_id'   => array(
+						'type'        => 'integer',
+						'description' => 'Staging post ID to sync.',
+					),
+					'slug'      => array(
+						'type'        => 'string',
+						'description' => 'Post slug when post_id is unknown.',
+					),
+					'post_type' => array(
+						'type'        => 'string',
+						'description' => 'Post type when resolving by slug.',
+					),
+				),
+			)
+		);
+	}
+
+	/**
+	 * GET /stls/v1/sync-config — STLS configuration diagnostics.
+	 *
+	 * @return WP_REST_Response
+	 */
+	public function rest_get_sync_config()
+	{
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'config'  => stls_get_sync_config_status(),
+			)
+		);
+	}
+
+	/**
+	 * POST /stls/v1/sync-to-live — push one post to the live site.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function rest_sync_to_live(WP_REST_Request $request)
+	{
+		$post_id   = (int) $request->get_param('post_id');
+		$slug      = sanitize_title((string) $request->get_param('slug'));
+		$post_type = sanitize_key((string) $request->get_param('post_type'));
+
+		if ($post_id <= 0 && $slug === '') {
+			return new WP_Error(
+				'missing_param',
+				__('Provide post_id or slug to sync.', 'staging-to-live-sync'),
+				array('status' => 400)
+			);
+		}
+
+		$result = $this->sync_post($post_id, $slug, $post_type);
+
+		if (is_wp_error($result)) {
+			$error_data = array('status' => 500);
+			if (in_array($result->get_error_code(), array('sync_failed', 'missing_api_key', 'invalid_api_key', 'api_key_not_configured'), true)) {
+				$error_data['config'] = stls_get_sync_config_status();
+			}
+			return new WP_Error($result->get_error_code(), $result->get_error_message(), $error_data);
+		}
+
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'message' => $result['message'],
+				'staging' => $result['staging'],
+				'live'    => $result['live'],
+				'synced'  => $result['synced'],
+			)
+		);
+	}
+
+	/**
 	 * Plugin activation
 	 */
 	public function activate()
 	{
 		$this->create_logs_table();
 		$this->schedule_log_cleanup();
+
+		if (get_option('stls_mcp_enabled', false) === false) {
+			add_option('stls_mcp_enabled', '1');
+		}
+
+		if (get_option('stls_log_retention_days', false) === false) {
+			add_option('stls_log_retention_days', 30);
+		}
 	}
 
 	/**
@@ -174,15 +380,20 @@ class Staging_To_Live_Sync
 	}
 
 	/**
-	 * Cleanup old logs (older than 30 days)
+	 * Log entry user name when sync is triggered via MCP.
+	 */
+	const MCP_LOG_USER_NAME = 'Sync via MCP';
+
+	/**
+	 * Cleanup old logs using configured retention days.
 	 */
 	public function cleanup_old_logs()
 	{
 		global $wpdb;
 
 		$table_name = $wpdb->prefix . 'stls_sync_logs';
-		$days = 30;
-		$date_threshold = date('Y-m-d H:i:s', strtotime("-{$days} days"));
+		$days = $this->get_log_retention_days();
+		$date_threshold = gmdate('Y-m-d H:i:s', strtotime("-{$days} days"));
 
 		$wpdb->query($wpdb->prepare(
 			"DELETE FROM $table_name WHERE sync_time < %s",
@@ -191,21 +402,60 @@ class Staging_To_Live_Sync
 	}
 
 	/**
+	 * @return int
+	 */
+	public function get_log_retention_days()
+	{
+		$days = (int) get_option('stls_log_retention_days', 30);
+		if ($days < 1) {
+			$days = 1;
+		}
+		if ($days > 365) {
+			$days = 365;
+		}
+
+		return $days;
+	}
+
+	/**
+	 * @param mixed $value Submitted value.
+	 * @return int
+	 */
+	public function sanitize_log_retention_days($value)
+	{
+		$days = absint($value);
+		if ($days < 1) {
+			$days = 1;
+		}
+		if ($days > 365) {
+			$days = 365;
+		}
+
+		return $days;
+	}
+
+	/**
 	 * Log sync activity
 	 *
 	 * @param int         $post_id             Post ID for content sync, or unused for special log types.
 	 * @param array|null  $file_sync_data      File batch sync metadata.
 	 * @param array|null  $acf_field_sync_data ACF field group sync: group_key, group_title, live_id, staging_id.
+	 * @param string      $source              Sync source: admin, mcp, or rest.
 	 */
-	private function log_sync_activity($post_id, $file_sync_data = null, $acf_field_sync_data = null)
+	private function log_sync_activity($post_id, $file_sync_data = null, $acf_field_sync_data = null, $source = 'admin')
 	{
 		global $wpdb;
 
 		$table_name = $wpdb->prefix . 'stls_sync_logs';
 
-		$user_id = get_current_user_id();
-		$user = wp_get_current_user();
-		$user_name = $user->display_name ? $user->display_name : $user->user_login;
+		if ($source === 'mcp') {
+			$user_id   = 0;
+			$user_name = self::MCP_LOG_USER_NAME;
+		} else {
+			$user_id   = get_current_user_id();
+			$user      = wp_get_current_user();
+			$user_name = $user->display_name ? $user->display_name : $user->user_login;
+		}
 
 		// ACF field group sync → live
 		if ($acf_field_sync_data !== null && is_array($acf_field_sync_data) && !empty($acf_field_sync_data['group_key'])) {
@@ -363,6 +613,16 @@ class Staging_To_Live_Sync
 			array($this, 'render_acf_field_sync_page')
 		);
 
+		// MCP submenu
+		add_submenu_page(
+			'staging-to-live-sync',
+			__('MCP', 'staging-to-live-sync'),
+			__('MCP', 'staging-to-live-sync'),
+			'manage_options',
+			'staging-to-live-sync-mcp',
+			array($this, 'render_mcp_page')
+		);
+
 		// Elementor Logs submenu (only if Elementor is selected)
 		$pagebuilder = get_option('stls_pagebuilder', 'acf_gutenberg');
 		if ($pagebuilder === 'elementor' && function_exists('stls_elementor_get_logs')) {
@@ -396,13 +656,19 @@ class Staging_To_Live_Sync
 
 		register_setting('stls_settings', 'stls_staging_api_key', array(
 			'type' => 'string',
-			'sanitize_callback' => 'sanitize_text_field',
+			'sanitize_callback' => 'stls_sanitize_api_key_option',
 			'default' => ''
 		));
 
 		register_setting('stls_settings', 'stls_live_api_key', array(
 			'type' => 'string',
-			'sanitize_callback' => 'sanitize_text_field',
+			'sanitize_callback' => 'stls_sanitize_api_key_option',
+			'default' => ''
+		));
+
+		register_setting('stls_settings', 'stls_debugger_emails', array(
+			'type' => 'string',
+			'sanitize_callback' => array($this, 'sanitize_debugger_emails'),
 			'default' => ''
 		));
 
@@ -423,6 +689,56 @@ class Staging_To_Live_Sync
 			'sanitize_callback' => array($this, 'sanitize_pagebuilder'),
 			'default' => 'acf_gutenberg'
 		));
+
+		register_setting('stls_settings', 'stls_sftp_enabled', array(
+			'type' => 'boolean',
+			'sanitize_callback' => array($this, 'sanitize_checkbox'),
+			'default' => false,
+		));
+
+		register_setting('stls_settings', 'stls_sftp_host', array(
+			'type' => 'string',
+			'sanitize_callback' => array('STLS_Credentials_Crypto', 'sanitize_field'),
+			'default' => '',
+		));
+
+		register_setting('stls_settings', 'stls_sftp_port', array(
+			'type' => 'integer',
+			'sanitize_callback' => array($this, 'sanitize_sftp_port'),
+			'default' => 2222,
+		));
+
+		register_setting('stls_settings', 'stls_sftp_username', array(
+			'type' => 'string',
+			'sanitize_callback' => array('STLS_Credentials_Crypto', 'sanitize_field'),
+			'default' => '',
+		));
+
+		register_setting('stls_settings', 'stls_sftp_password', array(
+			'type' => 'string',
+			'sanitize_callback' => array('STLS_Sftp', 'sanitize_password'),
+			'default' => '',
+		));
+
+		STLS_Mcp_Admin::register_settings();
+
+		register_setting(
+			'stls_logs_settings',
+			'stls_log_retention_days',
+			array(
+				'type'              => 'integer',
+				'sanitize_callback' => array($this, 'sanitize_log_retention_days'),
+				'default'           => 30,
+			)
+		);
+	}
+
+	/**
+	 * Render MCP settings page.
+	 */
+	public function render_mcp_page()
+	{
+		STLS_Mcp_Admin::render_page();
 	}
 
 	/**
@@ -485,12 +801,275 @@ class Staging_To_Live_Sync
 	}
 
 	/**
+	 * @param mixed $value Raw checkbox value.
+	 * @return bool
+	 */
+	public function sanitize_checkbox($value)
+	{
+		return !empty($value);
+	}
+
+	/**
+	 * @param mixed $value Raw port value.
+	 * @return int
+	 */
+	public function sanitize_sftp_port($value)
+	{
+		$port = (int) $value;
+		if ($port <= 0) {
+			return 2222;
+		}
+
+		return $port;
+	}
+
+	/**
+	 * Sanitize debugger notification emails (comma / semicolon / whitespace separated).
+	 *
+	 * @param mixed $value Raw option value.
+	 * @return string Comma-separated valid emails.
+	 */
+	public function sanitize_debugger_emails($value)
+	{
+		if (!is_string($value)) {
+			return '';
+		}
+		$parts = preg_split('/[\s,;]+/', $value, -1, PREG_SPLIT_NO_EMPTY);
+		$valid = array();
+		foreach ($parts as $p) {
+			$e = sanitize_email($p);
+			if ($e && is_email($e)) {
+				$valid[] = $e;
+			}
+		}
+		$valid = array_unique($valid);
+		return implode(', ', $valid);
+	}
+
+	/**
+	 * Register shutdown handler for PHP fatal errors.
+	 */
+	public function register_debugger_shutdown_notifier()
+	{
+		if (stls_debugger_get_recipient_emails() === array()) {
+			return;
+		}
+		static $done = false;
+		if ($done) {
+			return;
+		}
+		$done = true;
+		register_shutdown_function('stls_debugger_error_shutdown_handler');
+	}
+
+	/**
+	 * Register exception handler (after core) and preserve previous handler.
+	 */
+	public function register_debugger_exception_notifier()
+	{
+		if (stls_debugger_get_recipient_emails() === array()) {
+			return;
+		}
+		static $done = false;
+		if ($done) {
+			return;
+		}
+		$done = true;
+		$GLOBALS['stls_prev_exception_handler'] = set_exception_handler('stls_debugger_exception_handler');
+	}
+
+	/**
 	 * Check if a post type is disabled for syncing
 	 */
 	private function is_post_type_disabled($post_type)
 	{
 		$disabled_post_types = get_option('stls_disabled_post_types', array());
 		return in_array($post_type, $disabled_post_types, true);
+	}
+
+	/**
+	 * Whether the current site matches the configured staging URL.
+	 */
+	public function is_staging_site()
+	{
+		if ($this->is_live_site()) {
+			return false;
+		}
+
+		$staging_url = (string) get_option('stls_staging_url', '');
+		$live_url = (string) get_option('stls_live_url', '');
+
+		if ($staging_url !== '') {
+			$current_host = parse_url(home_url(), PHP_URL_HOST);
+			$staging_host = parse_url($staging_url, PHP_URL_HOST);
+
+			if ($current_host && $staging_host && (
+				$current_host === $staging_host ||
+				strpos($current_host, $staging_host) !== false ||
+				strpos($staging_host, $current_host) !== false
+			)) {
+				return true;
+			}
+		}
+
+		// Local / dev fallback: not the live site, live URL is configured elsewhere.
+		if ($live_url !== '' && !$this->is_live_site()) {
+			$env = function_exists('wp_get_environment_type') ? wp_get_environment_type() : '';
+			if (in_array($env, array('local', 'staging', 'development'), true)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether the current site matches the configured live URL.
+	 */
+	public function is_live_site()
+	{
+		$live_url = get_option('stls_live_url');
+		if (empty($live_url)) {
+			return false;
+		}
+
+		$current_host = parse_url(home_url(), PHP_URL_HOST);
+		$live_host = parse_url($live_url, PHP_URL_HOST);
+
+		return ($current_host === $live_host ||
+			(!empty($current_host) && !empty($live_host) &&
+				(strpos($current_host, $live_host) !== false ||
+					strpos($live_host, $current_host) !== false)));
+	}
+
+	/**
+	 * Resolve a post for sync by ID or slug.
+	 *
+	 * @param int    $post_id   Staging post ID.
+	 * @param string $slug      Post slug (post_name).
+	 * @param string $post_type Optional post type when resolving by slug.
+	 * @return WP_Post|WP_Error
+	 */
+	public function resolve_post_for_sync($post_id = 0, $slug = '', $post_type = '')
+	{
+		if ($post_id > 0) {
+			$post = get_post($post_id);
+			if (!$post || $post->post_type === 'revision') {
+				return new WP_Error('post_not_found', __('Post not found.', 'staging-to-live-sync'));
+			}
+			return $post;
+		}
+
+		$slug = sanitize_title($slug);
+		if ($slug === '') {
+			return new WP_Error('missing_identifier', __('Provide post_id or slug to sync.', 'staging-to-live-sync'));
+		}
+
+		if ($post_type !== '') {
+			$post = get_page_by_path($slug, OBJECT, sanitize_key($post_type));
+			if (!$post) {
+				return new WP_Error('post_not_found', sprintf(
+					/* translators: 1: slug, 2: post type */
+					__('No %2$s found with slug "%1$s".', 'staging-to-live-sync'),
+					$slug,
+					$post_type
+				));
+			}
+			return $post;
+		}
+
+		$post_types = get_post_types(array('public' => true), 'names');
+		foreach ($post_types as $type) {
+			if ($this->is_post_type_disabled($type)) {
+				continue;
+			}
+			$post = get_page_by_path($slug, OBJECT, $type);
+			if ($post) {
+				return $post;
+			}
+		}
+
+		return new WP_Error('post_not_found', sprintf(
+			/* translators: %s: post slug */
+			__('No post found with slug "%s".', 'staging-to-live-sync'),
+			$slug
+		));
+	}
+
+	/**
+	 * Sync a single post from staging to live (public API for MCP, REST, etc.).
+	 *
+	 * @param int    $post_id   Staging post ID (preferred).
+	 * @param string $slug      Post slug when ID is unknown.
+	 * @param string $post_type Optional post type when resolving by slug.
+	 * @param string $source    Sync source: admin (default), mcp, or rest.
+	 * @return array|WP_Error Sync result with staging/live post details.
+	 */
+	public function sync_post($post_id = 0, $slug = '', $post_type = '', $source = 'admin')
+	{
+		$source = in_array($source, array('admin', 'mcp', 'rest'), true) ? $source : 'admin';
+
+		if (!$this->is_staging_site()) {
+			return new WP_Error(
+				'not_staging_site',
+				__('Sync to live is only available on the staging site.', 'staging-to-live-sync')
+			);
+		}
+
+		if ($this->is_live_site()) {
+			return new WP_Error(
+				'on_live_site',
+				__('Cannot sync from the live site. Use the staging site.', 'staging-to-live-sync')
+			);
+		}
+
+		$post = $this->resolve_post_for_sync((int) $post_id, $slug, $post_type);
+		if (is_wp_error($post)) {
+			return $post;
+		}
+
+		if (!current_user_can('edit_post', $post->ID)) {
+			return new WP_Error(
+				'permission_denied',
+				__('You do not have permission to sync this post.', 'staging-to-live-sync')
+			);
+		}
+
+		if ($this->is_post_type_disabled($post->post_type)) {
+			return new WP_Error(
+				'post_type_disabled',
+				__('Sync is disabled for this post type.', 'staging-to-live-sync')
+			);
+		}
+
+		$staging_url = get_option('stls_staging_url');
+		$live_url = get_option('stls_live_url');
+		if (empty($staging_url) || empty($live_url)) {
+			return new WP_Error(
+				'urls_not_configured',
+				__('Staging or Live URL not configured. Set them under STLS Sync → Settings.', 'staging-to-live-sync')
+			);
+		}
+
+		$api_key = stls_get_outbound_api_key();
+		if ($api_key === '') {
+			return new WP_Error(
+				'api_key_not_configured',
+				__(
+					'Live API Key is not set on this staging site. Open STLS Sync → Settings, paste the same Live API Key used on your live site, and save.',
+					'staging-to-live-sync'
+				)
+			);
+		}
+
+		$result = $this->sync_post_to_live($post->ID, $staging_url, $live_url);
+		if (is_wp_error($result)) {
+			return $result;
+		}
+
+		$this->log_sync_activity($post->ID, null, null, $source);
+
+		return $result;
 	}
 
 	/**
@@ -566,7 +1145,7 @@ class Staging_To_Live_Sync
 									</button>
 								</div>
 								<p class="description">
-									<?php esc_html_e('Optional: API key for authentication with staging site. Click "Generate" to create a secure random key.', 'staging-to-live-sync'); ?>
+									<?php esc_html_e('Optional. Not used when pushing posts to live. Reserved for future reverse sync.', 'staging-to-live-sync'); ?>
 								</p>
 							</td>
 						</tr>
@@ -590,7 +1169,91 @@ class Staging_To_Live_Sync
 									</button>
 								</div>
 								<p class="description">
-									<?php esc_html_e('Optional: API key for authentication with live site. Click "Generate" to create a secure random key. Use the same key on both staging and live sites.', 'staging-to-live-sync'); ?>
+									<?php esc_html_e('Required for sync to live. Generate one key, paste the same value in Live API Key on BOTH staging and live sites, then save on each. Staging sends this key when syncing posts.', 'staging-to-live-sync'); ?>
+								</p>
+							</td>
+						</tr>
+						<tr>
+							<th scope="row">
+								<label><?php esc_html_e('SFTP Fallback (WP Engine / managed hosts)', 'staging-to-live-sync'); ?></label>
+							</th>
+							<td>
+								<?php
+								$sftp_enabled = (bool) get_option('stls_sftp_enabled', false);
+								$sftp_host = STLS_Credentials_Crypto::get_option('stls_sftp_host', '');
+								$sftp_port = (int) get_option('stls_sftp_port', 2222);
+								$sftp_username = STLS_Credentials_Crypto::get_option('stls_sftp_username', '');
+								$queue_count = count(get_option('stls_file_sync_queue', array()));
+								?>
+								<input type="hidden" name="stls_sftp_enabled" value="0" />
+								<label style="display:block; margin-bottom: 12px;">
+									<input type="checkbox" id="stls_sftp_enabled" name="stls_sftp_enabled" value="1" <?php checked($sftp_enabled); ?> />
+									<?php esc_html_e('Enable SFTP deploy when PHP cannot write theme/plugin files', 'staging-to-live-sync'); ?>
+								</label>
+								<div id="stls-sftp-settings-panel" class="stls-sftp-settings-panel" <?php echo $sftp_enabled ? '' : 'style="display:none;"'; ?>>
+								<div class="stls-sftp-security-notice" role="note">
+									<span class="dashicons dashicons-lock" aria-hidden="true"></span>
+									<span><?php esc_html_e('Your SFTP credentials are safe. Host, username, and password are encrypted with AES-256 before being stored in the WordPress database.', 'staging-to-live-sync'); ?></span>
+								</div>
+								<p class="description" style="margin-bottom: 12px;">
+									<?php esc_html_e('On staging: use your LIVE site SFTP credentials (WP Engine User Portal → SFTP). On live: use this site’s SFTP credentials. STLS uses SFTP automatically when a file lands in wp-content/uploads/stls-temp/.', 'staging-to-live-sync'); ?>
+								</p>
+								<div class="stls-sftp-fields">
+									<div class="stls-sftp-field stls-sftp-field--host">
+										<label for="stls_sftp_host"><?php esc_html_e('SFTP Host', 'staging-to-live-sync'); ?></label>
+										<input type="text" id="stls_sftp_host" name="stls_sftp_host" value="<?php echo esc_attr($sftp_host); ?>" class="regular-text" placeholder="yoursite.sftp.wpengine.com" />
+									</div>
+									<div class="stls-sftp-field stls-sftp-field--port">
+										<label for="stls_sftp_port"><?php esc_html_e('SFTP Port', 'staging-to-live-sync'); ?></label>
+										<input type="number" id="stls_sftp_port" name="stls_sftp_port" value="<?php echo esc_attr($sftp_port); ?>" class="small-text" min="1" />
+									</div>
+									<div class="stls-sftp-field stls-sftp-field--username">
+										<label for="stls_sftp_username"><?php esc_html_e('SFTP Username', 'staging-to-live-sync'); ?></label>
+										<input type="text" id="stls_sftp_username" name="stls_sftp_username" value="<?php echo esc_attr($sftp_username); ?>" class="regular-text" autocomplete="off" />
+									</div>
+									<div class="stls-sftp-field stls-sftp-field--password">
+										<label for="stls_sftp_password"><?php esc_html_e('SFTP Password', 'staging-to-live-sync'); ?></label>
+										<input type="password" id="stls_sftp_password" name="stls_sftp_password" value="" class="regular-text" autocomplete="new-password" placeholder="<?php esc_attr_e('Leave blank to keep existing password', 'staging-to-live-sync'); ?>" />
+									</div>
+								</div>
+								<p class="stls-sftp-actions">
+									<button type="button" class="button" id="stls-test-sftp-btn" data-nonce="<?php echo esc_attr(wp_create_nonce('stls_test_sftp')); ?>">
+										<?php esc_html_e('Test SFTP Connection', 'staging-to-live-sync'); ?>
+									</button>
+									<span id="stls-test-sftp-result" style="margin-left: 8px;"></span>
+								</p>
+								<?php if ($queue_count > 0) : ?>
+									<div style="margin-top: 12px; padding: 10px 12px; background: #fff8e5; border-left: 4px solid #dba617;">
+										<p style="margin: 0 0 8px;">
+											<?php
+											echo esc_html(
+												sprintf(
+													/* translators: %d: queued file count */
+													_n('%d file is waiting in the SFTP queue.', '%d files are waiting in the SFTP queue.', $queue_count, 'staging-to-live-sync'),
+													$queue_count
+												)
+											);
+											?>
+										</p>
+										<button type="button" class="button button-secondary" id="stls-apply-queue-btn" data-nonce="<?php echo esc_attr(wp_create_nonce('stls_apply_file_sync_queue')); ?>">
+											<?php esc_html_e('Apply Queued Files via SFTP', 'staging-to-live-sync'); ?>
+										</button>
+										<span id="stls-apply-queue-result" style="margin-left: 8px;"></span>
+									</div>
+								<?php endif; ?>
+								</div>
+							</td>
+						</tr>
+						<tr>
+							<th scope="row">
+								<label for="stls_debugger_emails"><?php esc_html_e('Debugger email(s)', 'staging-to-live-sync'); ?></label>
+							</th>
+							<td>
+								<input type="text" id="stls_debugger_emails" name="stls_debugger_emails" class="large-text"
+									value="<?php echo esc_attr(get_option('stls_debugger_emails', '')); ?>"
+									placeholder="dev@example.com, team@example.com" autocomplete="off" />
+								<p class="description">
+									<?php esc_html_e('When set, this site sends an email on PHP fatal errors and uncaught exceptions. Subject: Issue On: [site name]. The message includes the page title, full URL, and the real error details (message, file, line). Separate multiple addresses with commas.', 'staging-to-live-sync'); ?>
 								</p>
 							</td>
 						</tr>
@@ -814,10 +1477,16 @@ class Staging_To_Live_Sync
 			return;
 		}
 
+		$retention_days = $this->get_log_retention_days();
+
 		// Handle clear logs action
 		if (isset($_POST['stls_clear_logs']) && check_admin_referer('stls_clear_logs_action', 'stls_clear_logs_nonce')) {
 			$this->clear_logs();
 			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('All logs cleared successfully.', 'staging-to-live-sync') . '</p></div>';
+		}
+
+		if (isset($_GET['settings-updated']) && isset($_GET['page']) && $_GET['page'] === 'staging-to-live-sync-logs') {
+			echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Log retention settings saved.', 'staging-to-live-sync') . '</p></div>';
 		}
 
 		// Get logs from database
@@ -827,15 +1496,38 @@ class Staging_To_Live_Sync
 		<div class="wrap">
 			<h1><?php echo esc_html(get_admin_page_title()); ?></h1>
 
-			<div class="stls-logs-header" style="margin: 20px 0;">
+			<div class="stls-logs-header" style="margin: 20px 0; display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
+				<form method="post" action="options.php" style="display: flex; align-items: center; gap: 8px;">
+					<?php
+					settings_fields('stls_logs_settings');
+					?>
+					<label for="stls_log_retention_days">
+						<?php esc_html_e('Clear logs after', 'staging-to-live-sync'); ?>
+					</label>
+					<input type="number" id="stls_log_retention_days" name="stls_log_retention_days"
+						value="<?php echo esc_attr($retention_days); ?>" min="1" max="365" class="small-text" />
+					<label for="stls_log_retention_days">
+						<?php esc_html_e('days', 'staging-to-live-sync'); ?>
+					</label>
+					<?php submit_button(__('Save Retention', 'staging-to-live-sync'), 'secondary', 'submit', false); ?>
+				</form>
+
 				<form method="post" action="" style="display: inline-block;">
 					<?php wp_nonce_field('stls_clear_logs_action', 'stls_clear_logs_nonce'); ?>
 					<input type="hidden" name="stls_clear_logs" value="1" />
 					<?php submit_button(__('Clear All Logs', 'staging-to-live-sync'), 'secondary', 'clear', false); ?>
 				</form>
-				<span style="margin-left: 15px; color: #666;">
+
+				<span style="color: #666;">
 					<?php
-					echo esc_html(sprintf(__('Total log entries: %d (Logs older than 30 days are automatically deleted)', 'staging-to-live-sync'), $total_logs));
+					echo esc_html(
+						sprintf(
+							/* translators: 1: total log count, 2: retention days */
+							__('Total log entries: %1$d (Logs older than %2$d days are automatically deleted daily)', 'staging-to-live-sync'),
+							$total_logs,
+							$retention_days
+						)
+					);
 					?>
 				</span>
 			</div>
@@ -868,12 +1560,17 @@ class Staging_To_Live_Sync
 										<td><?php echo esc_html($log->id); ?></td>
 										<td>
 											<?php
-											$user = get_user_by('id', $log->user_id);
-											if ($user) {
-												echo esc_html($log->user_name);
-												echo '<br><small style="color: #666;">' . esc_html($user->user_email) . '</small>';
+											if ((int) $log->user_id === 0 && $log->user_name === self::MCP_LOG_USER_NAME) {
+												echo esc_html__('Sync via MCP', 'staging-to-live-sync');
+												echo '<br><small style="color: #666;">' . esc_html__('AI assistant', 'staging-to-live-sync') . '</small>';
 											} else {
-												echo esc_html($log->user_name);
+												$user = get_user_by('id', $log->user_id);
+												if ($user) {
+													echo esc_html($log->user_name);
+													echo '<br><small style="color: #666;">' . esc_html($user->user_email) . '</small>';
+												} else {
+													echo esc_html($log->user_name);
+												}
 											}
 											?>
 										</td>
@@ -2033,7 +2730,7 @@ class Staging_To_Live_Sync
 						if (response.data.details) {
 							resultsDiv.innerHTML += "<div style=\"margin-top: 10px;\"><strong>Details:</strong><ul style=\"margin: 10px 0;\">";
 							response.data.details.forEach(function(detail) {
-								var statusClass = detail.success ? "color: green;" : "color: red;";
+								var statusClass = detail.success ? (detail.warning ? "color: #856404;" : "color: green;") : "color: red;";
 								resultsDiv.innerHTML += "<li style=\"" + statusClass + "\">" + detail.file + ": " + detail.message + "</li>";
 							});
 							resultsDiv.innerHTML += "</ul></div>";
@@ -2132,26 +2829,7 @@ class Staging_To_Live_Sync
 			return $actions;
 		}
 
-		// Determine if we're on staging or live
-		$current_site_url = home_url();
-		$current_host = parse_url($current_site_url, PHP_URL_HOST);
-		$staging_host = parse_url($staging_url, PHP_URL_HOST);
-		$live_host = parse_url($live_url, PHP_URL_HOST);
-
-		// Only show sync button if we're on staging (not on live)
-		// This ensures we're syncing FROM staging TO live
-		$is_staging = ($current_host === $staging_host ||
-			(!empty($current_host) && !empty($staging_host) &&
-				(strpos($current_host, $staging_host) !== false ||
-					strpos($staging_host, $current_host) !== false)));
-
-		// Don't show sync button on live site
-		$is_live = ($current_host === $live_host ||
-			(!empty($current_host) && !empty($live_host) &&
-				(strpos($current_host, $live_host) !== false ||
-					strpos($live_host, $current_host) !== false)));
-
-		if ($is_staging && !$is_live) {
+		if ($this->is_staging_site() && !$this->is_live_site()) {
 			$actions['stls_sync'] = sprintf(
 				'<a href="#" class="stls-sync-post" data-post-id="%d" data-nonce="%s">%s</a>',
 				esc_attr($post->ID),
@@ -2220,6 +2898,48 @@ class Staging_To_Live_Sync
 		$api_key = $this->generate_secure_api_key();
 
 		wp_send_json_success(array('api_key' => $api_key));
+	}
+
+	/**
+	 * AJAX: test SFTP credentials.
+	 */
+	public function ajax_test_sftp()
+	{
+		if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'stls_test_sftp')) {
+			wp_send_json_error(array('message' => __('Security check failed.', 'staging-to-live-sync')));
+		}
+
+		if (!current_user_can('manage_options')) {
+			wp_send_json_error(array('message' => __('You do not have permission to test SFTP.', 'staging-to-live-sync')));
+		}
+
+		$result = STLS_Sftp::test_connection();
+		if (!empty($result['success'])) {
+			wp_send_json_success(array('message' => $result['message']));
+		}
+
+		wp_send_json_error(array('message' => isset($result['message']) ? $result['message'] : __('SFTP test failed.', 'staging-to-live-sync')));
+	}
+
+	/**
+	 * AJAX: apply queued file sync items via SFTP.
+	 */
+	public function ajax_apply_file_sync_queue()
+	{
+		if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'stls_apply_file_sync_queue')) {
+			wp_send_json_error(array('message' => __('Security check failed.', 'staging-to-live-sync')));
+		}
+
+		if (!current_user_can('manage_options')) {
+			wp_send_json_error(array('message' => __('You do not have permission to apply queued files.', 'staging-to-live-sync')));
+		}
+
+		$result = STLS_Sftp::apply_sync_queue();
+		if (!empty($result['success'])) {
+			wp_send_json_success($result);
+		}
+
+		wp_send_json_error($result);
 	}
 
 
@@ -3775,11 +4495,10 @@ class Staging_To_Live_Sync
 			wp_send_json_error(array('message' => __('Staging or Live URL not configured. Please configure in Settings > Staging to Live Sync.', 'staging-to-live-sync')));
 		}
 
-		// Enable debug mode if WP_DEBUG is on
 		$debug_mode = defined('WP_DEBUG') && WP_DEBUG;
 
 		// Perform sync
-		$result = $this->sync_post_to_live($post_id, $staging_url, $live_url);
+		$result = $this->sync_post($post_id);
 
 		if (is_wp_error($result)) {
 			if ($debug_mode) {
@@ -3788,14 +4507,16 @@ class Staging_To_Live_Sync
 			wp_send_json_error(array('message' => $result->get_error_message()));
 		}
 
-		// Log sync activity
-		$this->log_sync_activity($post_id);
-
 		if ($debug_mode) {
 			error_log('STLS Sync Success for Post ' . $post_id);
 		}
 
-		wp_send_json_success(array('message' => __('Post synced successfully!', 'staging-to-live-sync')));
+		wp_send_json_success(array(
+			'message' => __('Post synced successfully!', 'staging-to-live-sync'),
+			'staging' => $result['staging'],
+			'live' => $result['live'],
+			'synced' => $result['synced'],
+		));
 	}
 
 	/**
@@ -3844,8 +4565,8 @@ class Staging_To_Live_Sync
 		$error_count = 0;
 
 		// Get live site API key
-		$live_api_key = get_option('stls_live_api_key');
-		if (empty($live_api_key)) {
+		$live_api_key = stls_get_outbound_api_key();
+		if ($live_api_key === '') {
 			wp_send_json_error(array('message' => __('Live API key not configured. Please configure in Settings.', 'staging-to-live-sync')));
 		}
 
@@ -3949,6 +4670,14 @@ class Staging_To_Live_Sync
 				if ($debug_mode) {
 					error_log('STLS File Sync Error: ' . $file_name . ' - ' . $sync_result->get_error_message());
 				}
+			} elseif (is_array($sync_result) && !empty($sync_result['warning'])) {
+				$results[] = array(
+					'file' => $file_name,
+					'success' => true,
+					'warning' => true,
+					'message' => isset($sync_result['message']) ? $sync_result['message'] : __('File saved to temporary location on live.', 'staging-to-live-sync'),
+				);
+				$success_count++;
 			} else {
 				$results[] = array(
 					'file' => $file_name,
@@ -4097,7 +4826,7 @@ class Staging_To_Live_Sync
 		}
 
 		$live_url = untrailingslashit((string) get_option('stls_live_url', ''));
-		$api_key = (string) get_option('stls_live_api_key', '');
+		$api_key = stls_get_outbound_api_key();
 
 		if ($live_url === '' || $api_key === '') {
 			wp_send_json_error(array('message' => __('Configure Live URL and Live API key in Settings.', 'staging-to-live-sync')));
@@ -4108,16 +4837,27 @@ class Staging_To_Live_Sync
 		}
 
 		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/acf-field-groups';
-		$response = wp_remote_get(
+		$response = stls_remote_request_live(
 			$endpoint,
-			array(
-				'timeout' => 90,
-				'headers' => array(
-					'X-STLS-API-Key' => $api_key,
-					'Accept' => 'application/json',
-				),
-			)
+			$api_key,
+			'GET',
+			null,
+			90
 		);
+
+		if (!is_wp_error($response)) {
+			$code = wp_remote_retrieve_response_code($response);
+			$data = json_decode(wp_remote_retrieve_body($response), true);
+			if ($code === 404 && is_array($data) && isset($data['code']) && $data['code'] === 'rest_no_route') {
+				$response = stls_remote_request_live(
+					$endpoint,
+					$api_key,
+					'POST',
+					array('api_key' => $api_key),
+					90
+				);
+			}
+		}
 
 		if (is_wp_error($response)) {
 			wp_send_json_error(array('message' => $response->get_error_message()));
@@ -4134,6 +4874,9 @@ class Staging_To_Live_Sync
 					$msg = $data['message'];
 				} elseif (!empty($data['data']['message'])) {
 					$msg = $data['data']['message'];
+				}
+				if (isset($data['code']) && $data['code'] === 'rest_no_route') {
+					$msg = __('STLS REST route not found on live. Update the Staging-to-Live Sync plugin on the live site and save permalinks (Settings → Permalinks → Save).', 'staging-to-live-sync');
 				}
 			}
 			wp_send_json_error(array('message' => $msg, 'http_status' => $code));
@@ -4234,7 +4977,7 @@ class Staging_To_Live_Sync
 		}
 
 		$live_url = untrailingslashit((string) get_option('stls_live_url', ''));
-		$api_key = (string) get_option('stls_live_api_key', '');
+		$api_key = stls_get_outbound_api_key();
 
 		if ($live_url === '' || $api_key === '') {
 			wp_send_json_error(array('message' => __('Configure Live URL and Live API key in Settings.', 'staging-to-live-sync')));
@@ -4246,16 +4989,15 @@ class Staging_To_Live_Sync
 
 		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/sync-acf-field-group';
 
-		$response = wp_remote_post(
+		$response = stls_remote_request_live(
 			$endpoint,
+			$api_key,
+			'POST',
 			array(
-				'timeout' => 120,
-				'headers' => array(
-					'Content-Type' => 'application/json; charset=utf-8',
-					'X-STLS-API-Key' => $api_key,
-				),
-				'body' => wp_json_encode(array('field_group' => $export)),
-			)
+				'field_group' => $export,
+				'api_key'     => $api_key,
+			),
+			120
 		);
 
 		if (is_wp_error($response)) {
@@ -4327,43 +5069,36 @@ class Staging_To_Live_Sync
 	private function sync_file_to_live($staging_file_url, $file_path, $live_url, $api_key)
 	{
 		// Make request to live site to sync the file
-		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/sync-file';
+		$endpoint = stls_add_api_key_to_endpoint(
+			trailingslashit($live_url) . 'wp-json/stls/v1/sync-file',
+			$api_key
+		);
 
 		$debug_mode = defined('WP_DEBUG') && WP_DEBUG;
 
-		// Check if this is a PHP file - if so, read from filesystem and base64 encode
-		// to avoid execution when downloading via HTTP
+		// Read from local filesystem when possible (avoids HTTP fetch on live; required for PHP on managed hosts).
 		$file_extension = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
 		$php_extensions = array('php', 'phtml', 'php3', 'php4', 'php5', 'phps');
 		$is_php_file = in_array($file_extension, $php_extensions);
 
-		$file_content = null;
 		$file_content_base64 = null;
+		$file_content = null;
+		$wp_content_dir = WP_CONTENT_DIR;
+		$full_file_path = $wp_content_dir . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $file_path);
 
-		if ($is_php_file) {
-			// Read file directly from filesystem to avoid execution
-			$wp_content_dir = WP_CONTENT_DIR;
-			$full_file_path = $wp_content_dir . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $file_path);
-
-			if (file_exists($full_file_path) && is_readable($full_file_path)) {
-				$file_content = file_get_contents($full_file_path);
-				if ($file_content !== false) {
-					$file_content_base64 = base64_encode($file_content);
-					if ($debug_mode) {
-						error_log('STLS File Sync [STAGING]: PHP file detected, reading from filesystem and encoding');
-						error_log('STLS File Sync [STAGING]: File size: ' . strlen($file_content) . ' bytes');
-						error_log('STLS File Sync [STAGING]: Encoded size: ' . strlen($file_content_base64) . ' bytes');
-					}
-				} else {
-					if ($debug_mode) {
-						error_log('STLS File Sync [STAGING]: Failed to read PHP file from filesystem');
-					}
-				}
-			} else {
+		if (file_exists($full_file_path) && is_readable($full_file_path) && !is_dir($full_file_path)) {
+			$raw_content = file_get_contents($full_file_path);
+			if ($raw_content !== false) {
+				$file_content = $raw_content;
+				$file_content_base64 = base64_encode($file_content);
 				if ($debug_mode) {
-					error_log('STLS File Sync [STAGING]: PHP file not found or not readable: ' . $full_file_path);
+					error_log('STLS File Sync [STAGING]: Read file from filesystem, size: ' . strlen($file_content) . ' bytes');
 				}
+			} elseif ($debug_mode) {
+				error_log('STLS File Sync [STAGING]: Failed to read file from filesystem: ' . $full_file_path);
 			}
+		} elseif ($debug_mode) {
+			error_log('STLS File Sync [STAGING]: File not found or not readable: ' . $full_file_path);
 		}
 
 		if ($debug_mode) {
@@ -4377,14 +5112,18 @@ class Staging_To_Live_Sync
 
 		// Build request body
 		$request_body = array(
-			'file_url' => $staging_file_url,
+			'file_url'  => $staging_file_url,
 			'file_path' => $file_path,
+			'api_key'   => $api_key,
 		);
 
-		// If we have file content (for PHP files), include it
+		// Inline file payload — live site does not need to download from staging URL.
 		if (!empty($file_content_base64)) {
 			$request_body['file_content_base64'] = $file_content_base64;
-			$request_body['is_php_file'] = true;
+			$request_body['has_inline_content'] = true;
+			if ($is_php_file) {
+				$request_body['is_php_file'] = true;
+			}
 		}
 
 		$response = wp_remote_post($endpoint, array(
@@ -4476,6 +5215,30 @@ class Staging_To_Live_Sync
 			if ($debug_mode) {
 				error_log('STLS File Sync [STAGING]: File synced successfully');
 			}
+			if (!empty($response_data['warning'])) {
+				if ($file_content !== null && STLS_Sftp::is_enabled()) {
+					$sftp_result = STLS_Sftp::deploy_wp_content_file($file_path, $file_content);
+					if (!empty($sftp_result['success'])) {
+						if ($debug_mode) {
+							error_log('STLS File Sync [STAGING]: SFTP fallback succeeded for ' . $file_path);
+						}
+						return true;
+					}
+					if ($debug_mode) {
+						error_log('STLS File Sync [STAGING]: SFTP fallback failed - ' . (isset($sftp_result['message']) ? $sftp_result['message'] : 'unknown'));
+					}
+				}
+
+				$warning_message = isset($response_data['message']) ? $response_data['message'] : __('File saved to a temporary location on live. Move it manually via SFTP/SSH.', 'staging-to-live-sync');
+				if (!STLS_Sftp::is_enabled()) {
+					$warning_message .= ' ' . __('Enable SFTP Fallback under STLS Sync → Settings to deploy theme/plugin files automatically on WP Engine.', 'staging-to-live-sync');
+				}
+
+				return array(
+					'warning' => true,
+					'message' => $warning_message,
+				);
+			}
 			return true;
 		}
 
@@ -4534,6 +5297,9 @@ class Staging_To_Live_Sync
 		$processed_meta = $this->process_meta_for_images($all_post_meta, $acf_field_keys);
 
 		// Prepare post data
+		$author_id = (int) $post->post_author;
+		$author    = $author_id > 0 ? get_userdata($author_id) : false;
+
 		$post_data = array(
 			'title' => $post->post_title,
 			'content' => $post->post_content,
@@ -4545,6 +5311,13 @@ class Staging_To_Live_Sync
 			'post_date_gmt' => $post->post_date_gmt,
 			'post_modified' => $post->post_modified,
 			'post_modified_gmt' => $post->post_modified_gmt,
+			'author' => array(
+				'id'           => $author_id,
+				'email'        => $author ? $author->user_email : '',
+				'login'        => $author ? $author->user_login : '',
+				'nicename'     => $author ? $author->user_nicename : '',
+				'display_name' => $author ? $author->display_name : '',
+			),
 			'meta' => $processed_meta,
 		);
 
@@ -4563,6 +5336,9 @@ class Staging_To_Live_Sync
 				$post_data['acf_field_objects'] = $field_objects;
 			}
 		}
+
+		// Collect raw ACF post meta (repeaters, flexible content, sub-fields)
+		$post_data['acf_post_meta'] = stls_collect_acf_post_meta($post_id, $all_post_meta);
 
 		// Get ACF Gutenberg blocks data
 		$post_data['acf_blocks'] = $this->get_acf_gutenberg_blocks_data($post_id, $post->post_content);
@@ -4615,6 +5391,7 @@ class Staging_To_Live_Sync
 		// Process ACF fields to convert image IDs to URLs
 		$post_data['acf_fields'] = $this->convert_acf_image_fields_to_urls($post_data['acf_fields'] ?? array());
 		$post_data['acf_field_objects'] = $this->convert_acf_field_objects_images($post_data['acf_field_objects'] ?? array());
+		$post_data['acf_post_meta'] = $this->convert_acf_image_fields_to_urls($post_data['acf_post_meta'] ?? array());
 
 		// Get taxonomy terms with full data
 		$taxonomies = get_object_taxonomies($post->post_type);
@@ -4671,8 +5448,11 @@ class Staging_To_Live_Sync
 		$post_data = apply_filters('stls_post_data_before_sync', $post_data, $post_id);
 
 		// Prepare REST API endpoint
-		$api_key = get_option('stls_live_api_key');
-		$endpoint = trailingslashit($live_url) . 'wp-json/stls/v1/sync';
+		$api_key = stls_get_outbound_api_key();
+		$endpoint = stls_add_api_key_to_endpoint(
+			trailingslashit($live_url) . 'wp-json/stls/v1/sync',
+			$api_key
+		);
 
 		// Prepare request arguments
 		$args = array(
@@ -4715,14 +5495,293 @@ class Staging_To_Live_Sync
 			$error_message = __('Failed to sync post. Live site returned error code: ', 'staging-to-live-sync') . $response_code;
 			$response_data = json_decode($response_body, true);
 
-			if (isset($response_data['message'])) {
-				$error_message .= ' - ' . $response_data['message'];
+			if (is_array($response_data)) {
+				if (isset($response_data['code']) && $response_data['code'] === 'missing_api_key') {
+					$error_message = __(
+						'Live site rejected the sync: API key was not received. On staging, open STLS Sync → Settings and set the Live API Key to the exact same value as on your live site, then save.',
+						'staging-to-live-sync'
+					);
+				} elseif (isset($response_data['code']) && $response_data['code'] === 'invalid_api_key') {
+					$error_message = __(
+						'Live site rejected the sync: API key mismatch. The Live API Key must be identical on both staging and live (STLS Sync → Settings).',
+						'staging-to-live-sync'
+					);
+				} elseif (isset($response_data['message'])) {
+					$error_message .= ' - ' . $response_data['message'];
+				}
 			}
 
 			return new WP_Error('sync_failed', $error_message);
 		}
 
-		return true;
+		$response_data = json_decode($response_body, true);
+		if (!is_array($response_data)) {
+			$response_data = array();
+		}
+
+		return array(
+			'success' => true,
+			'message' => isset($response_data['message'])
+				? $response_data['message']
+				: __('Post synced successfully.', 'staging-to-live-sync'),
+			'staging' => array(
+				'post_id' => $post_id,
+				'slug' => $post->post_name,
+				'post_type' => $post->post_type,
+				'title' => $post->post_title,
+				'edit_url' => get_edit_post_link($post_id, 'raw'),
+				'preview_url' => get_permalink($post_id),
+			),
+			'live' => array(
+				'post_id' => isset($response_data['post_id']) ? (int) $response_data['post_id'] : 0,
+				'slug' => isset($response_data['slug']) ? $response_data['slug'] : $post->post_name,
+				'post_type' => isset($response_data['post_type']) ? $response_data['post_type'] : $post->post_type,
+				'title' => isset($response_data['title']) ? $response_data['title'] : $post->post_title,
+				'url' => isset($response_data['url']) ? $response_data['url'] : '',
+				'action' => isset($response_data['action']) ? $response_data['action'] : 'synced',
+				'author' => isset($response_data['author']) ? $response_data['author'] : null,
+				'acf_fields' => isset($response_data['acf_fields']) ? $response_data['acf_fields'] : array(),
+			),
+			'synced' => array(
+				'title' => true,
+				'content' => true,
+				'excerpt' => $post->post_excerpt !== '',
+				'custom_fields' => !empty($processed_meta),
+				'acf_fields' => !empty($post_data['acf_fields']) || !empty($post_data['acf_field_objects']) || !empty($post_data['acf_post_meta']),
+				'acf_blocks' => !empty($post_data['acf_blocks']),
+				'featured_image' => !empty($post_data['featured_image']),
+				'taxonomies' => !empty($post_data['taxonomies']),
+				'yoast_seo' => !empty($post_data['yoast_seo']),
+				'author' => !empty($post_data['author']['email']) || !empty($post_data['author']['login']),
+				'image_blocks' => !empty($post_data['image_blocks']),
+				'audio_blocks' => !empty($post_data['audio_blocks']),
+				'video_blocks' => !empty($post_data['video_blocks']),
+			),
+		);
+	}
+}
+
+/**
+ * Parsed list of debugger notification emails (empty if none configured).
+ *
+ * @return string[]
+ */
+function stls_debugger_get_recipient_emails()
+{
+	$raw = get_option('stls_debugger_emails', '');
+	if (!is_string($raw) || $raw === '') {
+		return array();
+	}
+	$parts = preg_split('/[\s,;]+/', $raw, -1, PREG_SPLIT_NO_EMPTY);
+	$out = array();
+	foreach ($parts as $p) {
+		$e = sanitize_email($p);
+		if ($e && is_email($e)) {
+			$out[] = $e;
+		}
+	}
+	return array_values(array_unique($out));
+}
+
+/**
+ * Current request URL for error reports.
+ *
+ * @return string
+ */
+function stls_debugger_current_url()
+{
+	if (function_exists('home_url')) {
+		$path = isset($_SERVER['REQUEST_URI']) ? wp_unslash($_SERVER['REQUEST_URI']) : '/';
+		return home_url($path);
+	}
+	$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+	$host = isset($_SERVER['HTTP_HOST']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_HOST'])) : '';
+	$uri = isset($_SERVER['REQUEST_URI']) ? wp_unslash($_SERVER['REQUEST_URI']) : '/';
+	if ($host === '') {
+		return $uri;
+	}
+	return $scheme . '://' . $host . $uri;
+}
+
+/**
+ * Best-effort page title for error reports.
+ *
+ * @return string
+ */
+function stls_debugger_detect_page_title()
+{
+	if (function_exists('is_admin') && is_admin()) {
+		$title = __('WordPress Admin', 'staging-to-live-sync');
+		if (!empty($_REQUEST['page'])) {
+			$title .= ' — ' . sanitize_text_field(wp_unslash($_REQUEST['page']));
+		}
+		return $title;
+	}
+	if (function_exists('wp_get_document_title')) {
+		$doc = @wp_get_document_title();
+		if (is_string($doc) && $doc !== '') {
+			return $doc;
+		}
+	}
+	return __('(Could not determine page title)', 'staging-to-live-sync');
+}
+
+/**
+ * Human-readable PHP error type.
+ *
+ * @param int $type Error type constant.
+ * @return string
+ */
+function stls_debugger_error_type_label($type)
+{
+	$map = array(
+		E_ERROR => 'E_ERROR',
+		E_PARSE => 'E_PARSE',
+		E_CORE_ERROR => 'E_CORE_ERROR',
+		E_COMPILE_ERROR => 'E_COMPILE_ERROR',
+		E_USER_ERROR => 'E_USER_ERROR',
+		E_RECOVERABLE_ERROR => 'E_RECOVERABLE_ERROR',
+	);
+	if (isset($map[$type])) {
+		return $map[$type];
+	}
+	return (string) $type;
+}
+
+/**
+ * Send debugger alert email if not rate-limited.
+ *
+ * @param string   $kind       'shutdown' or 'exception'.
+ * @param string   $message    Error message.
+ * @param string   $file       File path.
+ * @param int      $line       Line number.
+ * @param string   $type_label Error type label.
+ * @param string   $trace      Optional stack trace.
+ */
+function stls_debugger_maybe_send_alert($kind, $message, $file, $line, $type_label, $trace = '')
+{
+	static $in_handler = false;
+	if ($in_handler) {
+		return;
+	}
+
+	$recipients = stls_debugger_get_recipient_emails();
+	if ($recipients === array()) {
+		return;
+	}
+
+	$fingerprint = md5($kind . '|' . $message . '|' . $file . '|' . (string) $line);
+	$lock_key = 'stls_dbg_' . $fingerprint;
+	if (get_transient($lock_key)) {
+		return;
+	}
+	set_transient($lock_key, 1, 120);
+
+	$in_handler = true;
+
+	$site_name = function_exists('get_bloginfo') ? get_bloginfo('name') : '';
+	if ($site_name === '') {
+		$site_name = isset($_SERVER['HTTP_HOST']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_HOST'])) : __('Unknown site', 'staging-to-live-sync');
+	}
+
+	$subject = sprintf(
+		/* translators: %s: WordPress site name */
+		__('Issue On: %s', 'staging-to-live-sync'),
+		$site_name
+	);
+
+	$page_title = stls_debugger_detect_page_title();
+	$page_url = stls_debugger_current_url();
+
+	$body = sprintf(
+		"Page title: %s\nPage URL: %s\n\nKind: %s\nError type: %s\nMessage: %s\nFile: %s\nLine: %d\n",
+		$page_title,
+		$page_url,
+		$kind,
+		$type_label,
+		$message,
+		$file,
+		(int) $line
+	);
+
+	if ($trace !== '') {
+		$body .= "\nStack trace:\n" . $trace . "\n";
+	}
+
+	$body .= "\n--\n";
+	$body .= sprintf(
+		/* translators: %s: site URL */
+		__('Sent by STLS Sync from %s', 'staging-to-live-sync'),
+		$page_url
+	);
+
+	$to = implode(', ', $recipients);
+	wp_mail($to, $subject, $body);
+
+	$in_handler = false;
+}
+
+/**
+ * Shutdown handler: PHP fatal / parse errors (real message from error_get_last).
+ */
+function stls_debugger_error_shutdown_handler()
+{
+	if (stls_debugger_get_recipient_emails() === array()) {
+		return;
+	}
+
+	$err = error_get_last();
+	if ($err === null || !is_array($err)) {
+		return;
+	}
+
+	$fatal_types = array(
+		E_ERROR,
+		E_PARSE,
+		E_CORE_ERROR,
+		E_COMPILE_ERROR,
+		E_USER_ERROR,
+		E_RECOVERABLE_ERROR,
+	);
+
+	if (!in_array($err['type'], $fatal_types, true)) {
+		return;
+	}
+
+	$message = isset($err['message']) ? $err['message'] : '';
+	$file = isset($err['file']) ? $err['file'] : '';
+	$line = isset($err['line']) ? (int) $err['line'] : 0;
+	$type_label = stls_debugger_error_type_label($err['type']);
+
+	stls_debugger_maybe_send_alert('php_fatal', $message, $file, $line, $type_label, '');
+}
+
+/**
+ * Uncaught exception handler: include message, file, line, trace.
+ *
+ * @param Throwable $e Exception or Error.
+ */
+function stls_debugger_exception_handler($e)
+{
+	if (!($e instanceof \Throwable)) {
+		return;
+	}
+
+	if (stls_debugger_get_recipient_emails() !== array()) {
+		$trace = method_exists($e, 'getTraceAsString') ? $e->getTraceAsString() : '';
+		stls_debugger_maybe_send_alert(
+			'uncaught_exception',
+			$e->getMessage(),
+			$e->getFile(),
+			$e->getLine(),
+			get_class($e),
+			$trace
+		);
+	}
+
+	$prev = isset($GLOBALS['stls_prev_exception_handler']) ? $GLOBALS['stls_prev_exception_handler'] : null;
+	if (is_callable($prev)) {
+		call_user_func($prev, $e);
 	}
 }
 
@@ -4734,6 +5793,19 @@ function stls_init()
 
 // Initialize on plugins_loaded
 add_action('plugins_loaded', 'stls_init');
+
+/**
+ * Sync a single post from staging to live.
+ *
+ * @param int    $post_id   Staging post ID.
+ * @param string $slug      Post slug when ID is unknown.
+ * @param string $post_type Optional post type when resolving by slug.
+ * @return array|WP_Error
+ */
+function stls_sync_post($post_id = 0, $slug = '', $post_type = '')
+{
+	return Staging_To_Live_Sync::get_instance()->sync_post($post_id, $slug, $post_type);
+}
 
 // Include test file for debugging
 if (defined('WP_DEBUG') && WP_DEBUG) {
@@ -4764,11 +5836,20 @@ add_action('rest_api_init', function () {
 		'stls/v1',
 		'/acf-field-groups',
 		array(
-			'methods' => 'GET',
-			'callback' => 'stls_handle_acf_field_groups_request',
-			'permission_callback' => function ($request) {
-				return stls_check_sync_permission($request);
-			},
+			array(
+				'methods'             => WP_REST_Server::READABLE,
+				'callback'            => 'stls_handle_acf_field_groups_request',
+				'permission_callback' => function ($request) {
+					return stls_check_sync_permission($request);
+				},
+			),
+			array(
+				'methods'             => WP_REST_Server::CREATABLE,
+				'callback'            => 'stls_handle_acf_field_groups_request',
+				'permission_callback' => function ($request) {
+					return stls_check_sync_permission($request);
+				},
+			),
 		)
 	);
 
@@ -4786,60 +5867,304 @@ add_action('rest_api_init', function () {
 });
 
 /**
+ * Diagnostic snapshot of STLS sync configuration (no secret values exposed).
+ *
+ * @return array
+ */
+function stls_get_sync_config_status()
+{
+	$instance = Staging_To_Live_Sync::get_instance();
+	$live_key = (string) get_option('stls_live_api_key', '');
+	$staging_key = (string) get_option('stls_staging_api_key', '');
+	$outbound = stls_get_outbound_api_key();
+	$staging_url = (string) get_option('stls_staging_url', '');
+	$live_url = (string) get_option('stls_live_url', '');
+
+	$issues = array();
+	if (!$instance->is_staging_site()) {
+		$issues[] = 'This site is not recognized as staging. Connect WordPress MCP to your staging site, not live.';
+	}
+	if ($instance->is_live_site()) {
+		$issues[] = 'This site matches the configured live URL. Sync must be triggered from staging.';
+	}
+	if ($staging_url === '' || $live_url === '') {
+		$issues[] = 'Staging URL and/or Live URL are not configured in STLS Sync → Settings.';
+	}
+	if ($outbound === '') {
+		$issues[] = 'Live API Key is empty on this site. Set the same Live API Key on staging AND live, then click Save Changes.';
+	}
+	if (!stls_is_mcp_enabled()) {
+		$issues[] = 'STLS MCP integration is disabled. Enable it under STLS Sync → MCP to allow AI sync.';
+	}
+	if (!stls_is_wordpress_mcp_active()) {
+		$issues[] = 'WordPress MCP plugin is not active. Install and enable it on staging for AI sync tools.';
+	}
+	if ($live_key === '' && $staging_key !== '') {
+		$issues[] = 'Only Staging API Key is set. Sync uses Live API Key — copy your shared secret into the Live API Key field.';
+	}
+
+	return array(
+		'site_url'                   => home_url(),
+		'is_staging_site'            => $instance->is_staging_site(),
+		'is_live_site'               => $instance->is_live_site(),
+		'staging_url'                => $staging_url,
+		'live_url'                   => $live_url,
+		'live_api_key_configured'    => $live_key !== '',
+		'live_api_key_length'        => strlen($live_key),
+		'staging_api_key_configured' => $staging_key !== '',
+		'outbound_api_key_available' => $outbound !== '',
+		'outbound_api_key_source'    => $live_key !== ''
+			? 'live_api_key'
+			: ($staging_key !== '' ? 'staging_api_key_fallback' : 'none'),
+		'can_sync_from_here'         => $instance->is_staging_site()
+			&& !$instance->is_live_site()
+			&& $outbound !== ''
+			&& $live_url !== '',
+		'can_sync_via_mcp'           => $instance->is_staging_site()
+			&& !$instance->is_live_site()
+			&& $outbound !== ''
+			&& $live_url !== ''
+			&& stls_mcp_can_register_tools(),
+		'mcp_enabled'                => stls_is_mcp_enabled(),
+		'wordpress_mcp_active'       => stls_is_wordpress_mcp_active(),
+		'mcp_ready'                  => stls_mcp_can_register_tools(),
+		'issues'                     => $issues,
+		'next_steps'                 => array(
+			'1. Use MCP tool stls_sync_to_live (or POST /wp-json/stls/v1/sync-to-live) — NOT /stls/v1/sync.',
+			'2. Open STLS Sync → Settings on STAGING.',
+			'3. Ensure Live API Key matches on staging and live, then Save Changes.',
+			'4. Reconnect WordPress MCP in Cursor after plugin updates.',
+		),
+		'recommended_mcp_tool'       => 'stls_sync_to_live',
+		'recommended_rest_endpoint'  => '/wp-json/stls/v1/sync-to-live',
+		'do_not_use_rest_endpoint'   => '/wp-json/stls/v1/sync (live-site receiver only — returns missing_api_key on staging)',
+		'environment_type'           => function_exists('wp_get_environment_type') ? wp_get_environment_type() : '',
+	);
+}
+
+/**
+ * Normalize an API key value (preserve special characters; trim whitespace only).
+ *
+ * @param mixed $key Raw key value.
+ * @return string
+ */
+function stls_normalize_api_key($key)
+{
+	return trim((string) $key);
+}
+
+/**
+ * Sanitize API key option on save.
+ *
+ * @param mixed $value Submitted value.
+ * @return string
+ */
+function stls_sanitize_api_key_option($value)
+{
+	return stls_normalize_api_key($value);
+}
+
+/**
+ *
+ * @return string
+ */
+function stls_get_outbound_api_key()
+{
+	$key = stls_normalize_api_key(get_option('stls_live_api_key', ''));
+	if ($key !== '') {
+		return $key;
+	}
+
+	// Some setups store the shared secret only in the staging key field.
+	return stls_normalize_api_key(get_option('stls_staging_api_key', ''));
+}
+
+/**
+ * Extract the API key from an incoming sync REST request.
+ *
+ * Prefers header/body over query string so keys with special characters are not corrupted.
+ *
+ * @param WP_REST_Request $request REST request.
+ * @return string
+ */
+function stls_extract_request_api_key($request)
+{
+	if (!$request instanceof WP_REST_Request) {
+		return '';
+	}
+
+	$header_key = $request->get_header('X-STLS-API-Key');
+	if (empty($header_key)) {
+		$header_key = $request->get_header('x-stls-api-key');
+	}
+	if (!empty($header_key)) {
+		return stls_normalize_api_key($header_key);
+	}
+
+	if (!empty($_SERVER['HTTP_X_STLS_API_KEY'])) {
+		return stls_normalize_api_key(wp_unslash($_SERVER['HTTP_X_STLS_API_KEY']));
+	}
+
+	if (function_exists('getallheaders')) {
+		$headers = getallheaders();
+		if (isset($headers['X-STLS-API-Key']) && $headers['X-STLS-API-Key'] !== '') {
+			return stls_normalize_api_key($headers['X-STLS-API-Key']);
+		}
+		if (isset($headers['x-stls-api-key']) && $headers['x-stls-api-key'] !== '') {
+			return stls_normalize_api_key($headers['x-stls-api-key']);
+		}
+	}
+
+	$params = $request->get_json_params();
+	if (is_array($params) && !empty($params['api_key'])) {
+		return stls_normalize_api_key($params['api_key']);
+	}
+
+	$body = $request->get_body();
+	if ($body !== '') {
+		$decoded = json_decode($body, true);
+		if (is_array($decoded) && !empty($decoded['api_key'])) {
+			return stls_normalize_api_key($decoded['api_key']);
+		}
+	}
+
+	$query_key = $request->get_param('api_key');
+	if (!empty($query_key)) {
+		return stls_normalize_api_key($query_key);
+	}
+
+	return '';
+}
+
+/**
+ * Build auth headers for outbound live-site REST requests.
+ *
+ * @param string $api_key API key.
+ * @return array
+ */
+function stls_build_live_auth_headers($api_key)
+{
+	$headers = array(
+		'Accept' => 'application/json',
+	);
+
+	if ($api_key !== '') {
+		$headers['X-STLS-API-Key'] = $api_key;
+	}
+
+	return $headers;
+}
+
+/**
+ * Perform an authenticated HTTP request to the live STLS REST API.
+ *
+ * @param string       $endpoint Full URL (without api_key query arg).
+ * @param string       $api_key  Outbound API key.
+ * @param string       $method   HTTP method.
+ * @param array|string $body     Optional JSON body (api_key added when array).
+ * @param int          $timeout  Timeout in seconds.
+ * @return array|WP_Error
+ */
+function stls_remote_request_live($endpoint, $api_key, $method = 'GET', $body = null, $timeout = 90)
+{
+	$endpoint = stls_add_api_key_to_endpoint($endpoint, $api_key);
+	$method = strtoupper($method);
+
+	$args = array(
+		'method'  => $method,
+		'timeout' => $timeout,
+		'headers' => stls_build_live_auth_headers($api_key),
+	);
+
+	if (defined('WP_DEBUG') && WP_DEBUG) {
+		$args['sslverify'] = apply_filters('stls_remote_request_sslverify', false);
+	} else {
+		$args['sslverify'] = apply_filters('stls_remote_request_sslverify', true);
+	}
+
+	if ($body !== null) {
+		$args['headers']['Content-Type'] = 'application/json; charset=utf-8';
+		if (is_array($body)) {
+			if ($api_key !== '' && !isset($body['api_key'])) {
+				$body['api_key'] = $api_key;
+			}
+			$args['body'] = wp_json_encode($body);
+		} else {
+			$args['body'] = (string) $body;
+		}
+	}
+
+	return wp_remote_request($endpoint, $args);
+}
+
+/**
+ * Append api_key query arg to a sync endpoint URL.
+ *
+ * @param string $endpoint Endpoint URL.
+ * @param string $api_key  API key.
+ * @return string
+ */
+function stls_add_api_key_to_endpoint($endpoint, $api_key)
+{
+	if ($api_key === '') {
+		return $endpoint;
+	}
+
+	$separator = (strpos($endpoint, '?') !== false) ? '&' : '?';
+
+	return $endpoint . $separator . 'api_key=' . rawurlencode($api_key);
+}
+
+/**
  * Check permission for sync request
  */
 function stls_check_sync_permission($request)
 {
-	$api_key = get_option('stls_live_api_key');
+	$api_key = stls_get_outbound_api_key();
 
 	// If API key is configured, require it
-	if (!empty($api_key)) {
-		// Try multiple methods to get the API key header
-		$provided_key = '';
-
-		// Method 1: Try to get from request headers (various formats)
-		if ($request instanceof WP_REST_Request) {
-			$provided_key = $request->get_header('X-STLS-API-Key');
-
-			// Try with lowercase
-			if (empty($provided_key)) {
-				$provided_key = $request->get_header('x-stls-api-key');
-			}
-		}
-
-		// Method 2: Check $_SERVER (HTTP headers are prefixed with HTTP_ and uppercased)
-		if (empty($provided_key) && isset($_SERVER['HTTP_X_STLS_API_KEY'])) {
-			$provided_key = sanitize_text_field($_SERVER['HTTP_X_STLS_API_KEY']);
-		}
-
-		// Method 3: Use getallheaders if available
-		if (empty($provided_key) && function_exists('getallheaders')) {
-			$headers = getallheaders();
-			if (isset($headers['X-STLS-API-Key'])) {
-				$provided_key = $headers['X-STLS-API-Key'];
-			} elseif (isset($headers['x-stls-api-key'])) {
-				$provided_key = $headers['x-stls-api-key'];
-			}
-		}
-
-		// Method 4: Check request body for API key (most reliable for REST API)
-		if (empty($provided_key)) {
-			$params = $request->get_json_params();
-			if (isset($params['api_key'])) {
-				$provided_key = sanitize_text_field($params['api_key']);
-			}
-		}
+	if ($api_key !== '') {
+		$provided_key = stls_extract_request_api_key($request);
 
 		// Verify the API key
-		if (empty($provided_key)) {
-			return new WP_Error('missing_api_key', __('API key is required but not provided.', 'staging-to-live-sync'), array('status' => 401));
+		if ($provided_key === '') {
+			$instance = Staging_To_Live_Sync::get_instance();
+			if ($instance->is_staging_site() && current_user_can('edit_posts')) {
+				return new WP_Error(
+					'wrong_sync_endpoint',
+					__(
+						'Wrong endpoint: POST /stls/v1/sync is the live-site receiver. On staging, use the stls_sync_to_live MCP tool or POST /wp-json/stls/v1/sync-to-live with post_id.',
+						'staging-to-live-sync'
+					),
+					array(
+						'status'  => 400,
+						'use_instead' => '/wp-json/stls/v1/sync-to-live',
+						'mcp_tool'    => 'stls_sync_to_live',
+					)
+				);
+			}
+
+			return new WP_Error(
+				'missing_api_key',
+				__(
+					'API key is required but not provided. On staging, set the Live API Key (STLS Sync → Settings) to the same value as on this live site.',
+					'staging-to-live-sync'
+				),
+				array('status' => 401)
+			);
 		}
 
-		if ($provided_key !== $api_key) {
-			return new WP_Error('invalid_api_key', __('Invalid API key provided.', 'staging-to-live-sync'), array('status' => 401));
+		if (!hash_equals($api_key, $provided_key)) {
+			return new WP_Error(
+				'invalid_api_key',
+				__(
+					'Invalid API key. The Live API Key must be identical on both staging and live sites (STLS Sync → Settings).',
+					'staging-to-live-sync'
+				),
+				array('status' => 401)
+			);
 		}
 
-		// API key matches, allow the request
 		return true;
 	}
 
@@ -5080,6 +6405,190 @@ function stls_handle_acf_sync_field_group_request(WP_REST_Request $request)
 }
 
 /**
+ * Collect raw ACF post meta keys for a post (including repeater/sub-field rows).
+ *
+ * @param int   $post_id       Post ID.
+ * @param array $all_post_meta All post meta from get_post_meta().
+ * @return array
+ */
+function stls_collect_acf_post_meta($post_id, $all_post_meta)
+{
+	$acf_meta = array();
+
+	if (!function_exists('get_field_objects') || empty($all_post_meta) || !is_array($all_post_meta)) {
+		return $acf_meta;
+	}
+
+	$field_objects = get_field_objects($post_id);
+	if (empty($field_objects) || !is_array($field_objects)) {
+		return $acf_meta;
+	}
+
+	$field_names = array();
+	foreach ($field_objects as $name => $object) {
+		$field_names[] = is_array($object) && !empty($object['name']) ? $object['name'] : (string) $name;
+	}
+
+	foreach ($all_post_meta as $meta_key => $meta_values) {
+		$meta_key = (string) $meta_key;
+
+		foreach ($field_names as $field_name) {
+			if (
+				$meta_key === $field_name
+				|| $meta_key === '_' . $field_name
+				|| strpos($meta_key, $field_name . '_') === 0
+			) {
+				$value = is_array($meta_values) ? $meta_values[0] : $meta_values;
+				$acf_meta[$meta_key] = maybe_unserialize($value);
+				break;
+			}
+		}
+	}
+
+	return $acf_meta;
+}
+
+/**
+ * Sync ACF field data onto a live post.
+ *
+ * @param int   $post_id   Live post ID.
+ * @param array $post_data Sync payload from staging.
+ * @return array Field names synced.
+ */
+function stls_sync_acf_post_fields($post_id, $post_data)
+{
+	$synced = array();
+	$synced_names = array();
+
+	if (
+		empty($post_data['acf_field_objects'])
+		&& empty($post_data['acf_fields'])
+		&& empty($post_data['acf_post_meta'])
+	) {
+		return $synced;
+	}
+
+	// 1. Field objects (preferred — includes type info and field keys)
+	if (!empty($post_data['acf_field_objects']) && is_array($post_data['acf_field_objects']) && function_exists('update_field')) {
+		foreach ($post_data['acf_field_objects'] as $field_name => $field_object) {
+			if (!is_array($field_object) || !array_key_exists('value', $field_object)) {
+				continue;
+			}
+
+			$name = !empty($field_object['name']) ? $field_object['name'] : (string) $field_name;
+			$key  = !empty($field_object['key']) ? $field_object['key'] : $name;
+			$value = stls_convert_image_data_to_attachment_id($field_object['value'], $post_id, $key);
+
+			$ok = update_field($key, $value, $post_id);
+			if (!$ok) {
+				$ok = update_field($name, $value, $post_id);
+			}
+			if (!$ok) {
+				update_post_meta($post_id, $name, $value);
+				update_post_meta($post_id, '_' . $name, $key);
+			}
+
+			$synced[] = $name;
+			$synced_names[$name] = true;
+		}
+	}
+
+	// 2. get_fields() fallback for any top-level fields not covered above
+	if (!empty($post_data['acf_fields']) && is_array($post_data['acf_fields']) && function_exists('update_field')) {
+		foreach ($post_data['acf_fields'] as $field_name => $field_value) {
+			if (isset($synced_names[$field_name])) {
+				continue;
+			}
+
+			$value = stls_convert_image_data_to_attachment_id($field_value, $post_id, (string) $field_name);
+			if (!update_field($field_name, $value, $post_id)) {
+				update_post_meta($post_id, $field_name, $value);
+			}
+
+			$synced[] = (string) $field_name;
+			$synced_names[$field_name] = true;
+		}
+	}
+
+	// 3. Raw ACF meta (repeaters, flexible content, sub-fields, reference keys)
+	if (!empty($post_data['acf_post_meta']) && is_array($post_data['acf_post_meta'])) {
+		foreach ($post_data['acf_post_meta'] as $meta_key => $meta_value) {
+			$meta_key = (string) $meta_key;
+			$processed = stls_convert_image_data_to_attachment_id($meta_value, $post_id, $meta_key);
+			update_post_meta($post_id, $meta_key, $processed);
+
+			if (strpos($meta_key, '_') !== 0) {
+				$synced[] = $meta_key;
+			}
+		}
+	}
+
+	if (function_exists('acf_save_post')) {
+		acf_save_post($post_id);
+	}
+
+	return array_values(array_unique($synced));
+}
+
+/**
+ * Resolve a live-site user ID from staging author data.
+ *
+ * @param array $author_data       Author payload from staging.
+ * @param int   $existing_post_id  Live post ID when updating (keeps author if no match).
+ * @return int
+ */
+function stls_resolve_live_author_id($author_data, $existing_post_id = 0)
+{
+	if (!is_array($author_data)) {
+		$author_data = array();
+	}
+
+	$email = isset($author_data['email']) ? sanitize_email($author_data['email']) : '';
+	if ($email !== '' && is_email($email)) {
+		$user = get_user_by('email', $email);
+		if ($user instanceof WP_User) {
+			return (int) $user->ID;
+		}
+	}
+
+	$login = isset($author_data['login']) ? sanitize_user($author_data['login'], true) : '';
+	if ($login !== '') {
+		$user = get_user_by('login', $login);
+		if ($user instanceof WP_User) {
+			return (int) $user->ID;
+		}
+	}
+
+	$nicename = isset($author_data['nicename']) ? sanitize_title($author_data['nicename']) : '';
+	if ($nicename !== '') {
+		$user = get_user_by('slug', $nicename);
+		if ($user instanceof WP_User) {
+			return (int) $user->ID;
+		}
+	}
+
+	if ($existing_post_id > 0) {
+		$existing_author = (int) get_post_field('post_author', $existing_post_id);
+		if ($existing_author > 0 && get_userdata($existing_author)) {
+			return $existing_author;
+		}
+	}
+
+	$admins = get_users(
+		array(
+			'role'   => 'administrator',
+			'number' => 1,
+			'fields' => 'ID',
+		)
+	);
+	if (!empty($admins)) {
+		return (int) $admins[0];
+	}
+
+	return 1;
+}
+
+/**
  * Handle sync request on live site
  */
 function stls_handle_sync_request(WP_REST_Request $request)
@@ -5114,6 +6623,10 @@ function stls_handle_sync_request(WP_REST_Request $request)
 		'post_status' => sanitize_text_field($post_data['status']),
 		'post_type' => sanitize_text_field($post_data['post_type']),
 		'post_name' => $slug,
+		'post_author' => stls_resolve_live_author_id(
+			isset($post_data['author']) ? $post_data['author'] : array(),
+			$post_id
+		),
 	);
 
 	// Add post date if provided
@@ -5217,21 +6730,10 @@ function stls_handle_sync_request(WP_REST_Request $request)
 		}
 	}
 
-	// Update ACF fields - use field objects if available for better compatibility
-	if (isset($post_data['acf_field_objects']) && function_exists('update_field')) {
-		foreach ($post_data['acf_field_objects'] as $field_key => $field_object) {
-			if (isset($field_object['value'])) {
-				// Pass field_key to determine return format
-				$field_value = stls_convert_image_data_to_attachment_id($field_object['value'], $post_id, $field_key);
-				update_field($field_key, $field_value, $post_id);
-			}
-		}
-	} elseif (isset($post_data['acf_fields']) && function_exists('update_field')) {
-		foreach ($post_data['acf_fields'] as $field_key => $field_value) {
-			// Pass field_key to determine return format
-			$processed_value = stls_convert_image_data_to_attachment_id($field_value, $post_id, $field_key);
-			update_field($field_key, $processed_value, $post_id);
-		}
+	// Update ACF fields (field objects, get_fields fallback, and raw ACF meta)
+	$synced_acf_fields = stls_sync_acf_post_fields($post_id, $post_data);
+	if (defined('WP_DEBUG') && WP_DEBUG && !empty($synced_acf_fields)) {
+		error_log('STLS: Synced ACF fields: ' . implode(', ', $synced_acf_fields));
 	}
 
 	// Update ACF Gutenberg blocks
@@ -5594,48 +7096,460 @@ function stls_handle_sync_request(WP_REST_Request $request)
 	// This allows pagebuilder sync modules to process their data after standard meta is synced
 	do_action('stls_after_sync_post_meta', $post_id, $post_data);
 
+	$sync_action = $existing_post ? 'updated' : 'created';
+	$live_author = get_userdata((int) get_post_field('post_author', $post_id));
+
 	return rest_ensure_response(array(
 		'success' => true,
 		'post_id' => $post_id,
+		'slug' => get_post_field('post_name', $post_id),
+		'post_type' => get_post_field('post_type', $post_id),
+		'title' => get_the_title($post_id),
+		'url' => get_permalink($post_id),
+		'action' => $sync_action,
+		'author' => array(
+			'id'           => $live_author ? (int) $live_author->ID : 0,
+			'display_name' => $live_author ? $live_author->display_name : '',
+			'email'        => $live_author ? $live_author->user_email : '',
+		),
+		'acf_fields' => isset($synced_acf_fields) ? $synced_acf_fields : array(),
 		'message' => __('Post synced successfully.', 'staging-to-live-sync'),
 	));
 }
 
 /**
- * Write string to a file using fopen/fwrite/flock.
- * Managed hosts (e.g. WP Engine) may disable file_put_contents(); this path usually remains available.
+ * Whether the site runs on a managed host with stricter filesystem rules (e.g. WP Engine).
  *
- * @param string $path     Absolute filesystem path.
- * @param string $contents Binary-safe content.
- * @param bool   $append   If true, append; otherwise truncate then write.
+ * @return bool
+ */
+function stls_is_managed_host()
+{
+	if (defined('PWP_NAME') || defined('WPE_APIKEY') || defined('WPE_CLUSTER_ID')) {
+		return true;
+	}
+
+	if (getenv('IS_WPE')) {
+		return true;
+	}
+
+	if (defined('KINSTAMU_VERSION') || getenv('KINSTA_CACHE_ZONE')) {
+		return true;
+	}
+
+	return (bool) apply_filters('stls_is_managed_host', false);
+}
+
+/**
+ * Initialize the WordPress Filesystem API for a directory context.
+ *
+ * @param string|false $context Directory path.
+ * @return WP_Filesystem_Base|false
+ */
+function stls_bootstrap_filesystem($context = false)
+{
+	global $wp_filesystem;
+
+	if (!empty($wp_filesystem)) {
+		return $wp_filesystem;
+	}
+
+	if (!function_exists('WP_Filesystem')) {
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+	}
+
+	if (false === $context) {
+		$context = WP_CONTENT_DIR;
+	}
+
+	if (WP_Filesystem(false, $context, true)) {
+		return $wp_filesystem;
+	}
+
+	return false;
+}
+
+/**
+ * Whether a path is inside wp-content/themes or wp-content/plugins.
+ *
+ * @param string $path Absolute or relative path.
+ * @return bool
+ */
+function stls_is_restricted_code_path($path)
+{
+	$normalized = wp_normalize_path($path);
+	$content_dir = wp_normalize_path(WP_CONTENT_DIR);
+	$themes_dir = wp_normalize_path($content_dir . '/themes/');
+	$plugins_dir = wp_normalize_path($content_dir . '/plugins/');
+
+	return (strpos($normalized, $themes_dir) === 0 || strpos($normalized, $plugins_dir) === 0);
+}
+
+/**
+ * Host-specific guidance when theme/plugin writes fail.
+ *
+ * @param string $target_path Absolute target path.
+ * @return string
+ */
+function stls_get_managed_host_write_hint($target_path)
+{
+	if (!stls_is_managed_host() || !stls_is_restricted_code_path($target_path)) {
+		return '';
+	}
+
+	return __(
+		' WP Engine and similar hosts often block PHP from writing theme/plugin files. Use SFTP, SSH Gateway, Git deploy, or Local Push for code files.',
+		'staging-to-live-sync'
+	);
+}
+
+/**
+ * Write string to a file using fopen/fwrite, optionally with flock.
+ *
+ * @param string $path      Absolute filesystem path.
+ * @param string $contents  Binary-safe content.
+ * @param bool   $append    If true, append; otherwise truncate then write.
+ * @param bool   $use_flock Whether to use flock (disabled on managed hosts).
  * @return int|false Bytes written, or false on failure.
  */
-function stls_fwrite_contents($path, $contents, $append = false)
+function stls_fwrite_contents($path, $contents, $append = false, $use_flock = true)
 {
+	if (stls_is_managed_host()) {
+		$use_flock = false;
+	}
+
 	$mode = $append ? 'ab' : 'wb';
 	$fp = @fopen($path, $mode);
 	if (false === $fp) {
 		return false;
 	}
-	if (!@flock($fp, LOCK_EX)) {
+
+	if ($use_flock && !@flock($fp, LOCK_EX)) {
 		fclose($fp);
 		return false;
 	}
+
 	$length = strlen($contents);
 	$written = 0;
 	while ($written < $length) {
 		$n = @fwrite($fp, substr($contents, $written));
 		if (false === $n || 0 === $n) {
-			flock($fp, LOCK_UN);
+			if ($use_flock) {
+				@flock($fp, LOCK_UN);
+			}
 			fclose($fp);
 			return false;
 		}
 		$written += $n;
 	}
+
 	@fflush($fp);
-	flock($fp, LOCK_UN);
+	if ($use_flock) {
+		flock($fp, LOCK_UN);
+	}
 	fclose($fp);
+
 	return $written;
+}
+
+/**
+ * Whether a filename looks like a PHP file.
+ *
+ * @param string $path File path.
+ * @return bool
+ */
+function stls_is_php_filename($path)
+{
+	$extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+	$php_extensions = array('php', 'phtml', 'php3', 'php4', 'php5', 'phps');
+
+	return in_array($extension, $php_extensions, true);
+}
+
+/**
+ * Build a safe temp path for staged file sync (never use .php under uploads).
+ *
+ * @param string $temp_base Temp directory absolute path.
+ * @return string
+ */
+function stls_get_temp_sync_path($temp_base)
+{
+	return trailingslashit($temp_base) . 'stls_tmp_' . wp_unique_id() . '.stls';
+}
+
+/**
+ * Write a file using the same fopen/fwrite pattern as All-in-One WP Migration.
+ *
+ * @param string $path       Absolute path.
+ * @param string $contents   File contents.
+ * @param int    $file_perms File mode.
+ * @param int    $dir_perms  Directory mode.
+ * @return bool
+ */
+function stls_write_file_ai1wm_style($path, $contents, $file_perms, $dir_perms)
+{
+	$dir = dirname($path);
+	if (!file_exists($dir)) {
+		wp_mkdir_p($dir);
+		@chmod($dir, $dir_perms);
+	}
+
+	if (file_exists($path)) {
+		@chmod($path, $file_perms);
+		@unlink($path);
+	}
+
+	$handle = @fopen($path, 'wb');
+	if (false === $handle) {
+		return false;
+	}
+
+	$length = strlen($contents);
+	$offset = 0;
+	while ($offset < $length) {
+		$chunk_size = min(512000, $length - $offset);
+		$chunk = substr($contents, $offset, $chunk_size);
+		$written = @fwrite($handle, $chunk);
+		if (false === $written || 0 === $written) {
+			@fclose($handle);
+			return false;
+		}
+		$offset += $written;
+	}
+
+	@fclose($handle);
+	@chmod($path, $file_perms);
+
+	return true;
+}
+
+/**
+ * Write file contents using a single strategy (no temp fallback).
+ *
+ * @param string $path        Absolute path.
+ * @param string $contents    File contents.
+ * @param int    $file_perms  File mode.
+ * @param int    $dir_perms   Directory mode.
+ * @return array{success:bool,method?:string,details?:array}
+ */
+function stls_write_file_simple($path, $contents, $file_perms, $dir_perms)
+{
+	$dir = dirname($path);
+	if (!file_exists($dir)) {
+		wp_mkdir_p($dir);
+		@chmod($dir, $dir_perms);
+	}
+
+	if (stls_write_file_ai1wm_style($path, $contents, $file_perms, $dir_perms)) {
+		return array('success' => true, 'method' => 'ai1wm_fwrite');
+	}
+
+	$fs = stls_bootstrap_filesystem($dir);
+	if ($fs && method_exists($fs, 'put_contents') && $fs->put_contents($path, $contents, $file_perms)) {
+		return array('success' => true, 'method' => 'wp_filesystem');
+	}
+
+	if (@file_put_contents($path, $contents) !== false) {
+		@chmod($path, $file_perms);
+		return array('success' => true, 'method' => 'file_put_contents');
+	}
+
+	if (stls_fwrite_contents($path, $contents, false, false) !== false) {
+		@chmod($path, $file_perms);
+		return array('success' => true, 'method' => 'fwrite');
+	}
+
+	return array('success' => false);
+}
+
+/**
+ * Move or copy a file into its final destination.
+ *
+ * @param string $source     Source absolute path.
+ * @param string $dest       Destination absolute path.
+ * @param int    $file_perms File mode.
+ * @return array{success:bool,method?:string}
+ */
+function stls_move_file_on_disk($source, $dest, $file_perms)
+{
+	$dest_dir = dirname($dest);
+	if (!file_exists($dest_dir)) {
+		wp_mkdir_p($dest_dir);
+	}
+
+	if (file_exists($dest)) {
+		@chmod($dest, $file_perms);
+		@unlink($dest);
+	}
+
+	$fs = stls_bootstrap_filesystem($dest_dir);
+	if ($fs && method_exists($fs, 'move') && $fs->move($source, $dest, true)) {
+		@chmod($dest, $file_perms);
+		return array('success' => true, 'method' => 'wp_filesystem_move');
+	}
+
+	if (@rename($source, $dest)) {
+		@chmod($dest, $file_perms);
+		return array('success' => true, 'method' => 'rename');
+	}
+
+	if ($fs && method_exists($fs, 'copy') && $fs->copy($source, $dest, true)) {
+		@chmod($dest, $file_perms);
+		@unlink($source);
+		return array('success' => true, 'method' => 'wp_filesystem_copy');
+	}
+
+	if (@copy($source, $dest)) {
+		@chmod($dest, $file_perms);
+		@unlink($source);
+		return array('success' => true, 'method' => 'copy');
+	}
+
+	if ($fs && method_exists($fs, 'put_contents') && file_exists($source) && is_readable($source)) {
+		$body = file_get_contents($source);
+		if (false !== $body && $fs->put_contents($dest, $body, $file_perms)) {
+			@unlink($source);
+			return array('success' => true, 'method' => 'wp_filesystem_read_put');
+		}
+	}
+
+	return array('success' => false);
+}
+
+/**
+ * Write a file to disk with managed-host fallbacks.
+ *
+ * @param string $target_path Absolute destination path.
+ * @param string $contents    File contents.
+ * @param int    $file_perms  File mode.
+ * @param int    $dir_perms   Directory mode.
+ * @return array
+ */
+function stls_write_file_to_disk($target_path, $contents, $file_perms = null, $dir_perms = null)
+{
+	$file_perms = null !== $file_perms ? $file_perms : (defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0644);
+	$dir_perms = null !== $dir_perms ? $dir_perms : (defined('FS_CHMOD_DIR') ? FS_CHMOD_DIR : 0755);
+
+	$direct = stls_write_file_simple($target_path, $contents, $file_perms, $dir_perms);
+	if ($direct['success']) {
+		return $direct;
+	}
+
+	$upload_dir = wp_upload_dir();
+	if (!empty($upload_dir['error'])) {
+		$last_error = error_get_last();
+		return array(
+			'success' => false,
+			'message' => __('Failed to write file to disk.', 'staging-to-live-sync') . stls_get_managed_host_write_hint($target_path),
+			'details' => array(
+				'upload_dir_error' => $upload_dir['error'],
+				'php_error' => $last_error,
+				'target_dir_writable' => is_writable(dirname($target_path)),
+			),
+		);
+	}
+
+	$temp_base = trailingslashit($upload_dir['basedir']) . 'stls-temp';
+	if (!file_exists($temp_base)) {
+		wp_mkdir_p($temp_base);
+		@chmod($temp_base, $dir_perms);
+	}
+
+	$temp_file = stls_get_temp_sync_path($temp_base);
+	$temp_write = stls_write_file_simple($temp_file, $contents, $file_perms, $dir_perms);
+	if (!$temp_write['success']) {
+		$last_error = error_get_last();
+		$message = __('Failed to write file to disk.', 'staging-to-live-sync');
+		if (stls_is_managed_host() && stls_is_restricted_code_path($target_path)) {
+			$message .= stls_get_managed_host_write_hint($target_path);
+		}
+		if ($last_error && !empty($last_error['message'])) {
+			$message .= ' (' . $last_error['message'] . ')';
+		}
+
+		return array(
+			'success' => false,
+			'message' => $message,
+			'details' => array(
+				'temp_file' => $temp_file,
+				'temp_dir_writable' => is_writable($temp_base),
+				'target_dir_writable' => is_writable(dirname($target_path)),
+				'target_is_code_path' => stls_is_restricted_code_path($target_path),
+				'php_error' => $last_error,
+				'managed_host' => stls_is_managed_host(),
+			),
+		);
+	}
+
+	$move = stls_move_file_on_disk($temp_file, $target_path, $file_perms);
+	if ($move['success']) {
+		@unlink($temp_file);
+		return array(
+			'success' => true,
+			'method' => 'temp_then_' . $move['method'],
+		);
+	}
+
+	if (STLS_Sftp::is_enabled()) {
+		$sftp_result = STLS_Sftp::upload_local_file($temp_file, $target_path);
+		if (!empty($sftp_result['success'])) {
+			@unlink($temp_file);
+			stls_remove_matching_sync_queue_item($target_path);
+			return array(
+				'success' => true,
+				'method'  => isset($sftp_result['method']) ? 'sftp_' . $sftp_result['method'] : 'sftp',
+				'message' => isset($sftp_result['message']) ? $sftp_result['message'] : __('File deployed via SFTP.', 'staging-to-live-sync'),
+			);
+		}
+	}
+
+	$relative_temp = str_replace(WP_CONTENT_DIR, 'wp-content', $temp_file);
+	$relative_target = str_replace(WP_CONTENT_DIR, 'wp-content', $target_path);
+	$queue = get_option('stls_file_sync_queue', array());
+	$queue[] = array(
+		'temp_file' => $temp_file,
+		'target_file' => $target_path,
+		'timestamp' => current_time('mysql'),
+		'file_size' => strlen($contents),
+	);
+	update_option('stls_file_sync_queue', $queue);
+
+	return array(
+		'success' => true,
+		'warning' => true,
+		'method' => 'temp_only',
+		'temp_location' => $relative_temp,
+		'message' => sprintf(
+			/* translators: 1: temp path, 2: target path, 3: optional host hint */
+			__('File saved to temporary location %1$s but could not be moved to %2$s.%3$s Configure SFTP Fallback under STLS Sync → Settings, then click Apply Queued Files via SFTP.', 'staging-to-live-sync'),
+			$relative_temp,
+			$relative_target,
+			stls_get_managed_host_write_hint($target_path)
+		),
+	);
+}
+
+/**
+ * Remove a queued sync item after successful deploy.
+ *
+ * @param string $target_path Absolute target path.
+ */
+function stls_remove_matching_sync_queue_item($target_path)
+{
+	$queue = get_option('stls_file_sync_queue', array());
+	if (!is_array($queue) || empty($queue)) {
+		return;
+	}
+
+	$target_path = wp_normalize_path($target_path);
+	$queue = array_values(array_filter($queue, function ($item) use ($target_path) {
+		if (!is_array($item) || empty($item['target_file'])) {
+			return true;
+		}
+
+		return wp_normalize_path($item['target_file']) !== $target_path;
+	}));
+
+	update_option('stls_file_sync_queue', $queue);
 }
 
 /**
@@ -5826,9 +7740,9 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 
 		$file_body = '';
 
-		// If we have base64 encoded content (for PHP files), decode it
-		if (!empty($file_content_base64) && $is_php_file) {
-			$force_log('STLS File Sync [LIVE]: Processing PHP file with base64 content');
+		// Inline base64 payload from staging (preferred — no HTTP download needed).
+		if (!empty($file_content_base64)) {
+			$force_log('STLS File Sync [LIVE]: Processing inline base64 file content');
 			$file_body = base64_decode($file_content_base64, true);
 			if ($file_body === false) {
 				$force_log('STLS File Sync [LIVE]: ERROR - Failed to decode base64 content');
@@ -5923,344 +7837,40 @@ function stls_handle_file_sync_request(WP_REST_Request $request)
 			}
 		}
 
-		// Write file to destination
+		// Write file to destination (WP_Filesystem + managed-host fallbacks).
 		$force_log('STLS File Sync [LIVE]: Attempting to write file');
 		$force_log('STLS File Sync [LIVE]: File path: ' . $full_file_path);
 		$force_log('STLS File Sync [LIVE]: File body size: ' . strlen($file_body) . ' bytes');
-		$force_log('STLS File Sync [LIVE]: Directory is writable: ' . var_export(is_writable($file_dir), true));
 
-		// Check if file already exists and its permissions
-		if (file_exists($full_file_path)) {
-			$force_log('STLS File Sync [LIVE]: File already exists, checking permissions');
-			$current_perms = fileperms($full_file_path);
-			$force_log('STLS File Sync [LIVE]: Current file permissions: ' . substr(sprintf('%o', $current_perms), -4));
-			$force_log('STLS File Sync [LIVE]: File is writable: ' . var_export(is_writable($full_file_path), true));
+		$write_result = stls_write_file_to_disk($full_file_path, $file_body, $file_perms, $dir_perms);
 
-			// Try to make it writable if it's not (WP Engine default: 0664)
-			if (!is_writable($full_file_path)) {
-				$force_log('STLS File Sync [LIVE]: Attempting to change file permissions to 0664 (WP Engine default)');
-				@chmod($full_file_path, 0664);
-				$force_log('STLS File Sync [LIVE]: File is writable after chmod: ' . var_export(is_writable($full_file_path), true));
-			}
+		if (empty($write_result['success'])) {
+			$error_message = isset($write_result['message']) ? $write_result['message'] : __('Failed to write file to disk.', 'staging-to-live-sync');
+			$error_details = isset($write_result['details']) ? $write_result['details'] : array();
+			$force_log('STLS File Sync [LIVE]: Write failed - ' . $error_message);
+			$force_log('STLS File Sync [LIVE]: Full error details: ' . print_r($error_details, true));
+			$write_log('STLS File Sync [LIVE]: Write failed - ' . $error_message);
 
-			// Try to delete the existing file first (backup approach)
-			if (!is_writable($full_file_path)) {
-				$force_log('STLS File Sync [LIVE]: File still not writable, attempting to delete and recreate');
-				$deleted = @unlink($full_file_path);
-				$force_log('STLS File Sync [LIVE]: File deletion result: ' . var_export($deleted, true));
-				if (!$deleted) {
-					$force_log('STLS File Sync [LIVE]: WARNING - Could not delete existing file, will attempt overwrite');
-				}
-			}
+			return new WP_Error('write_failed', $error_message, array('status' => 500, 'details' => $error_details));
 		}
 
-		// Use a temporary file approach: write to wp-content/uploads first (usually writable on WP Engine)
-		// Then move to final location
-		$upload_dir = wp_upload_dir();
-		$temp_base_dir = $upload_dir['basedir'] . '/stls-temp';
+		if (!empty($write_result['warning'])) {
+			$warning_message = isset($write_result['message']) ? $write_result['message'] : __('File saved to a temporary location on live.', 'staging-to-live-sync');
+			$force_log('STLS File Sync [LIVE]: File sync completed with warning - ' . $warning_message);
+			$write_log('STLS File Sync [LIVE]: File sync completed with warning');
 
-		// Ensure temp directory exists
-		if (!file_exists($temp_base_dir)) {
-			wp_mkdir_p($temp_base_dir);
-			@chmod($temp_base_dir, $dir_perms);
-			$force_log('STLS File Sync [LIVE]: Created temp directory: ' . $temp_base_dir);
-		} else {
-			// Make sure temp directory has correct permissions
-			@chmod($temp_base_dir, $dir_perms);
+			return rest_ensure_response(array(
+				'success' => true,
+				'file_path' => $file_path,
+				'warning' => true,
+				'message' => $warning_message,
+				'temp_location' => isset($write_result['temp_location']) ? $write_result['temp_location'] : '',
+				'target_location' => str_replace(WP_CONTENT_DIR, 'wp-content', $full_file_path),
+				'instructions' => __('Move the file manually via SFTP/SSH or use your host file manager.', 'staging-to-live-sync'),
+			));
 		}
 
-		// Create temp file in uploads directory (which is usually writable)
-		$temp_file = $temp_base_dir . '/stls_tmp_' . time() . '_' . basename($full_file_path);
-		$force_log('STLS File Sync [LIVE]: Attempting to write to temporary file in uploads: ' . $temp_file);
-		$force_log('STLS File Sync [LIVE]: Temp directory is writable: ' . var_export(is_writable($temp_base_dir), true));
-		$force_log('STLS File Sync [LIVE]: Using file permissions: ' . sprintf('%o', $file_perms));
-		$force_log('STLS File Sync [LIVE]: Using directory permissions: ' . sprintf('%o', $dir_perms));
-
-		// Clear any previous PHP errors
-		$previous_error = error_get_last();
-
-		// Attempt to write to temporary file first (avoid file_put_contents — often disabled on managed hosting)
-		$file_written = stls_fwrite_contents($temp_file, $file_body, false);
-
-		// Set permissions on temp file if it was created
-		if ($file_written !== false && file_exists($temp_file)) {
-			@chmod($temp_file, $file_perms);
-		}
-
-		// Check for errors
-		$last_error = error_get_last();
-
-		if ($file_written === false) {
-			$error_message = __('Failed to write file to disk.', 'staging-to-live-sync');
-			$error_details = array();
-
-			$force_log('STLS File Sync [LIVE]: ERROR - Failed to write to temporary file: ' . $temp_file);
-			$error_details['temp_file'] = $temp_file;
-			$error_details['temp_dir_writable'] = is_writable($temp_base_dir);
-			$error_details['temp_dir_perms'] = file_exists($temp_base_dir) ? substr(sprintf('%o', fileperms($temp_base_dir)), -4) : 'N/A';
-
-			// Get detailed error information
-			if ($last_error && (!$previous_error || $last_error['message'] !== $previous_error['message'])) {
-				$error_message .= ' ' . $last_error['message'];
-				$error_details['php_error'] = $last_error;
-				$force_log('STLS File Sync [LIVE]: PHP Error: ' . $last_error['message'] . ' in ' . $last_error['file'] . ' on line ' . $last_error['line']);
-			}
-
-			// Check disk space
-			$free_space = @disk_free_space($file_dir);
-			$error_details['free_disk_space'] = $free_space !== false ? number_format($free_space / 1024 / 1024, 2) . ' MB' : 'Unknown';
-			$force_log('STLS File Sync [LIVE]: Free disk space: ' . $error_details['free_disk_space']);
-			if ($free_space !== false && $free_space < strlen($file_body)) {
-				$error_message .= ' ' . __('Insufficient disk space.', 'staging-to-live-sync');
-				$error_details['disk_space'] = $free_space;
-			}
-
-			// Try direct write as fallback
-			$force_log('STLS File Sync [LIVE]: Attempting direct write as fallback');
-			$direct_write = stls_fwrite_contents($full_file_path, $file_body, false);
-			if ($direct_write !== false) {
-				$force_log('STLS File Sync [LIVE]: Direct write succeeded!');
-				@chmod($full_file_path, $file_perms);
-				$file_written = $direct_write;
-			} else {
-				$direct_error = error_get_last();
-				if ($direct_error) {
-					$error_message .= ' Direct write failed: ' . $direct_error['message'];
-					$error_details['direct_write_error'] = $direct_error;
-				}
-				$error_details['target_dir_writable'] = is_writable($file_dir);
-				$error_details['target_dir_perms'] = file_exists($file_dir) ? substr(sprintf('%o', fileperms($file_dir)), -4) : 'N/A';
-				$error_details['target_file_exists'] = file_exists($full_file_path);
-				if (file_exists($full_file_path)) {
-					$error_details['target_file_perms'] = substr(sprintf('%o', fileperms($full_file_path)), -4);
-					$error_details['target_file_writable'] = is_writable($full_file_path);
-				}
-
-				$force_log('STLS File Sync [LIVE]: Direct write also failed');
-				$force_log('STLS File Sync [LIVE]: Error details: ' . print_r($error_details, true));
-
-				// Include detailed error information in the message
-				$detailed_message = $error_message;
-				if (!empty($error_details['php_error']['message'])) {
-					$detailed_message .= ' (' . $error_details['php_error']['message'] . ')';
-				}
-				if (isset($error_details['temp_dir_writable']) && !$error_details['temp_dir_writable']) {
-					$detailed_message .= ' Temp dir not writable.';
-				}
-				if (isset($error_details['target_dir_writable']) && !$error_details['target_dir_writable']) {
-					$detailed_message .= ' Target dir not writable.';
-				}
-
-				// Log the full error details
-				$write_log('STLS File Sync [LIVE]: Write failed - ' . $detailed_message);
-				$write_log('STLS File Sync [LIVE]: Full error details: ' . print_r($error_details, true));
-
-				return new WP_Error('write_failed', $detailed_message, array('status' => 500, 'details' => $error_details));
-			}
-		} else {
-			// Successfully wrote to temp file, now rename it
-			$force_log('STLS File Sync [LIVE]: Successfully wrote to temporary file, renaming to final location');
-			$force_log('STLS File Sync [LIVE]: Temp file: ' . $temp_file);
-			$force_log('STLS File Sync [LIVE]: Target file: ' . $full_file_path);
-			$force_log('STLS File Sync [LIVE]: Temp file exists: ' . var_export(file_exists($temp_file), true));
-			$force_log('STLS File Sync [LIVE]: Target file exists: ' . var_export(file_exists($full_file_path), true));
-
-			// If target file exists, try to delete it first
-			if (file_exists($full_file_path)) {
-				$force_log('STLS File Sync [LIVE]: Target file exists, attempting to delete it first');
-				$force_log('STLS File Sync [LIVE]: Target file is writable: ' . var_export(is_writable($full_file_path), true));
-				$force_log('STLS File Sync [LIVE]: Target file permissions: ' . substr(sprintf('%o', fileperms($full_file_path)), -4));
-
-				// Try to make it writable first - use FS_CHMOD_FILE if defined
-				$file_perms = defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0664;
-				@chmod($full_file_path, $file_perms);
-
-				// Try to delete
-				$deleted = @unlink($full_file_path);
-				$force_log('STLS File Sync [LIVE]: Target file deletion result: ' . var_export($deleted, true));
-
-				if (!$deleted) {
-					$force_log('STLS File Sync [LIVE]: WARNING - Could not delete existing file, will attempt to overwrite');
-				}
-			}
-
-			// Try WordPress Filesystem API first (better for managed hosting)
-			global $wp_filesystem;
-			$wp_filesystem_success = false;
-
-			if (empty($wp_filesystem)) {
-				$force_log('STLS File Sync [LIVE]: Initializing WordPress Filesystem API');
-				require_once(ABSPATH . '/wp-admin/includes/file.php');
-
-				// Try to initialize with direct method (no credentials needed)
-				$credentials = request_filesystem_credentials('', '', false, false, null);
-				$force_log('STLS File Sync [LIVE]: Filesystem credentials result: ' . var_export($credentials, true));
-
-				// Initialize filesystem - try direct method first
-				$init_result = WP_Filesystem(false, $file_dir, true);
-				$force_log('STLS File Sync [LIVE]: WP_Filesystem() initialization result: ' . var_export($init_result, true));
-
-				if (!$init_result) {
-					$force_log('STLS File Sync [LIVE]: WP_Filesystem() initialization failed');
-					if (!empty($wp_filesystem->errors) && is_wp_error($wp_filesystem->errors)) {
-						$force_log('STLS File Sync [LIVE]: Filesystem errors: ' . $wp_filesystem->errors->get_error_message());
-					}
-				} else {
-					$force_log('STLS File Sync [LIVE]: WP_Filesystem() initialized successfully');
-					$force_log('STLS File Sync [LIVE]: Filesystem method: ' . (isset($wp_filesystem->method) ? $wp_filesystem->method : 'Unknown'));
-				}
-			} else {
-				$force_log('STLS File Sync [LIVE]: WordPress Filesystem API already initialized');
-				$force_log('STLS File Sync [LIVE]: Filesystem method: ' . (isset($wp_filesystem->method) ? $wp_filesystem->method : 'Unknown'));
-			}
-
-			if (!empty($wp_filesystem) && method_exists($wp_filesystem, 'put_contents')) {
-				$force_log('STLS File Sync [LIVE]: Attempting WordPress Filesystem API write');
-				$force_log('STLS File Sync [LIVE]: Target file path: ' . $full_file_path);
-				$force_log('STLS File Sync [LIVE]: File body size: ' . strlen($file_body) . ' bytes');
-
-				// Use FS_CHMOD_FILE constant if defined, otherwise use default
-				$wp_write = $wp_filesystem->put_contents($full_file_path, $file_body, $file_perms);
-
-				if ($wp_write !== false) {
-					$force_log('STLS File Sync [LIVE]: WordPress Filesystem API write succeeded!');
-					@unlink($temp_file);
-					$file_written = strlen($file_body);
-					$wp_filesystem_success = true;
-				} else {
-					$force_log('STLS File Sync [LIVE]: WordPress Filesystem API write failed');
-
-					// Check for errors
-					if (!empty($wp_filesystem->errors) && is_wp_error($wp_filesystem->errors)) {
-						$force_log('STLS File Sync [LIVE]: Filesystem API errors: ' . $wp_filesystem->errors->get_error_message());
-						$force_log('STLS File Sync [LIVE]: Filesystem API error codes: ' . print_r($wp_filesystem->errors->get_error_codes(), true));
-					}
-
-					// Check if file was partially written
-					if (file_exists($full_file_path)) {
-						$existing_size = filesize($full_file_path);
-						$force_log('STLS File Sync [LIVE]: File exists after failed write, size: ' . $existing_size . ' bytes (expected: ' . strlen($file_body) . ' bytes)');
-					}
-				}
-			} else {
-				$force_log('STLS File Sync [LIVE]: WordPress Filesystem API not available or put_contents method missing');
-				if (empty($wp_filesystem)) {
-					$force_log('STLS File Sync [LIVE]: $wp_filesystem is empty');
-				} else {
-					$force_log('STLS File Sync [LIVE]: put_contents method exists: ' . var_export(method_exists($wp_filesystem, 'put_contents'), true));
-				}
-			}
-
-			if (!$wp_filesystem_success) {
-				// Try rename first (atomic operation)
-				$renamed = @rename($temp_file, $full_file_path);
-				$force_log('STLS File Sync [LIVE]: Rename result: ' . var_export($renamed, true));
-
-				if (!$renamed) {
-					// Get the error if available
-					$rename_error = error_get_last();
-					if ($rename_error) {
-						$force_log('STLS File Sync [LIVE]: Rename error: ' . $rename_error['message']);
-					}
-
-					$force_log('STLS File Sync [LIVE]: WARNING - Failed to rename temp file, attempting copy instead');
-
-					// Try copy as fallback (copy works across filesystems)
-					$copied = @copy($temp_file, $full_file_path);
-					$force_log('STLS File Sync [LIVE]: Copy from temp to final location result: ' . var_export($copied, true));
-
-					if (!$copied) {
-						$copy_error = error_get_last();
-						if ($copy_error) {
-							$force_log('STLS File Sync [LIVE]: Copy error: ' . $copy_error['message']);
-						}
-
-						// Try using WordPress Filesystem API copy
-						if (!empty($wp_filesystem) && method_exists($wp_filesystem, 'copy')) {
-							$force_log('STLS File Sync [LIVE]: Attempting WordPress Filesystem API copy');
-							$wp_copy = $wp_filesystem->copy($temp_file, $full_file_path, true);
-							if ($wp_copy) {
-								$force_log('STLS File Sync [LIVE]: WordPress Filesystem API copy succeeded!');
-								@unlink($temp_file);
-								$file_written = strlen($file_body);
-								$copied = true;
-							} else {
-								$force_log('STLS File Sync [LIVE]: WordPress Filesystem API copy failed');
-							}
-						}
-
-						if (!$copied) {
-							// Last resort: try direct write
-							$force_log('STLS File Sync [LIVE]: Copy failed, attempting direct write as last resort');
-							$direct_write = stls_fwrite_contents($full_file_path, $file_body, false);
-
-							if ($direct_write !== false) {
-								$force_log('STLS File Sync [LIVE]: Direct write succeeded!');
-								@unlink($temp_file);
-								$file_written = $direct_write;
-							} else {
-								$direct_error = error_get_last();
-								if ($direct_error) {
-									$force_log('STLS File Sync [LIVE]: Direct write error: ' . $direct_error['message']);
-								}
-
-								// ALTERNATIVE APPROACH: File is already saved in uploads/stls-temp/
-								// Keep it there and return success with instructions
-								$force_log('STLS File Sync [LIVE]: All write methods failed, using alternative approach');
-								$force_log('STLS File Sync [LIVE]: File successfully saved to: ' . $temp_file);
-								$force_log('STLS File Sync [LIVE]: Target location: ' . $full_file_path);
-
-								// Store file mapping for potential manual sync or retry
-								$sync_queue = get_option('stls_file_sync_queue', array());
-								$sync_queue[] = array(
-									'temp_file' => $temp_file,
-									'target_file' => $full_file_path,
-									'file_path' => $file_path,
-									'timestamp' => current_time('mysql'),
-									'file_size' => strlen($file_body),
-								);
-								update_option('stls_file_sync_queue', $sync_queue);
-
-								$force_log('STLS File Sync [LIVE]: File added to sync queue. Total queued files: ' . count($sync_queue));
-
-								// Return success with warning - file is saved, just needs manual move
-								return rest_ensure_response(array(
-									'success' => true,
-									'file_path' => $file_path,
-									'warning' => true,
-									'message' => sprintf(
-										__('File synced to temporary location due to permission restrictions. File saved to: %s. Please move it manually to: %s via SFTP/SSH or WP Engine User Portal.', 'staging-to-live-sync'),
-										str_replace(WP_CONTENT_DIR, 'wp-content', $temp_file),
-										str_replace(WP_CONTENT_DIR, 'wp-content', $full_file_path)
-									),
-									'temp_location' => str_replace(WP_CONTENT_DIR, 'wp-content', $temp_file),
-									'target_location' => str_replace(WP_CONTENT_DIR, 'wp-content', $full_file_path),
-									'instructions' => __('You can move the file manually via SFTP/SSH or use WP Engine User Portal file manager.', 'staging-to-live-sync'),
-								));
-							}
-						} else {
-							@unlink($temp_file);
-							$force_log('STLS File Sync [LIVE]: Successfully copied temp file to final location');
-						}
-					} else {
-						@unlink($temp_file);
-						$force_log('STLS File Sync [LIVE]: Successfully copied temp file to final location');
-					}
-				} else {
-					$force_log('STLS File Sync [LIVE]: Successfully renamed temp file to final location');
-				}
-			}
-		}
-
-		$force_log('STLS File Sync [LIVE]: File downloaded and written successfully');
-		$force_log('STLS File Sync [LIVE]: File size: ' . $file_written . ' bytes');
-		$force_log('STLS File Sync [LIVE]: File path: ' . $full_file_path);
-
-		// Set proper file permissions - use FS_CHMOD_FILE if defined
-		$file_perms = defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0664;
-		@chmod($full_file_path, $file_perms);
-
-		// File has been written directly to destination, no need to move
+		$force_log('STLS File Sync [LIVE]: File written via ' . (isset($write_result['method']) ? $write_result['method'] : 'unknown'));
 		$force_log('STLS File Sync [LIVE]: File sync completed successfully');
 		if ($debug_mode) {
 			error_log('STLS File Sync: Successfully synced file - ' . $file_path);

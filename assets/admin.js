@@ -165,5 +165,73 @@ jQuery(document).ready(function($) {
 		
 		$temp.remove();
 	}
+
+	$(document).on('change', '#stls_sftp_enabled', function() {
+		$('#stls-sftp-settings-panel').toggle(this.checked);
+	});
+
+	$(document).on('click', '#stls-test-sftp-btn', function(e) {
+		e.preventDefault();
+		var $button = $(this);
+		var $result = $('#stls-test-sftp-result');
+		var originalText = $button.text();
+
+		$button.prop('disabled', true).text('Testing...');
+		$result.text('');
+
+		$.ajax({
+			url: stlsData.ajaxUrl,
+			type: 'POST',
+			data: {
+				action: 'stls_test_sftp',
+				nonce: $button.data('nonce')
+			},
+			success: function(response) {
+				if (response.success) {
+					$result.css('color', '#008a20').text(response.data.message || 'SFTP OK');
+				} else {
+					$result.css('color', '#b32d2e').text(response.data && response.data.message ? response.data.message : 'SFTP test failed');
+				}
+			},
+			error: function() {
+				$result.css('color', '#b32d2e').text('SFTP test failed');
+			},
+			complete: function() {
+				$button.prop('disabled', false).text(originalText);
+			}
+		});
+	});
+
+	$(document).on('click', '#stls-apply-queue-btn', function(e) {
+		e.preventDefault();
+		var $button = $(this);
+		var $result = $('#stls-apply-queue-result');
+		var originalText = $button.text();
+
+		$button.prop('disabled', true).text('Applying...');
+		$result.text('');
+
+		$.ajax({
+			url: stlsData.ajaxUrl,
+			type: 'POST',
+			data: {
+				action: 'stls_apply_file_sync_queue',
+				nonce: $button.data('nonce')
+			},
+			success: function(response) {
+				if (response.success) {
+					$result.css('color', '#008a20').text(response.data.message || 'Queue applied');
+				} else {
+					$result.css('color', '#b32d2e').text(response.data && response.data.message ? response.data.message : 'Queue apply failed');
+				}
+			},
+			error: function() {
+				$result.css('color', '#b32d2e').text('Queue apply failed');
+			},
+			complete: function() {
+				$button.prop('disabled', false).text(originalText);
+			}
+		});
+	});
 });
 
